@@ -23,7 +23,9 @@ group "default" {
 }
 
 target "image" {
-  inherits = ["docker-metadata-action"]
+  inherits   = ["docker-metadata-action"]
+  context    = "apps/lighthouse"
+  dockerfile = "Dockerfile"
   args = {
     VERSION         = "${VERSION}"
     DISTRIBUTED_REF = "${DISTRIBUTED_REF}"

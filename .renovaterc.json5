@@ -1,0 +1,18 @@
+{
+  $schema: "https://docs.renovatebot.com/renovate-schema.json",
+  extends: [
+    "config:recommended",
+    ":semanticCommits",
+    ":automergeDigest",
+  ],
+  customManagers: [
+    {
+      customType: "regex",
+      description: "Bump pinned versions/refs in docker-bake.hcl",
+      managerFilePatterns: ["/(^|/)docker-bake\\.hcl$/"],
+      matchStrings: [
+        "//\\s*renovate:\\s*datasource=(?<datasource>\\S+)\\s+depName=(?<depName>\\S+)(?:\\s+packageName=(?<packageName>\\S+))?(?:\\s+extractVersion=(?<extractVersion>\\S+))?[^\\n]*\\n\\s*default\\s*=\\s*\"(?<currentValue>[^\"]+)\"",
+      ],
+    },
+  ],
+}

@@ -1,0 +1,81 @@
+package workflow
+
+import "testing"
+
+// A ComfyUI POST /prompt body wraps the node graph under "prompt".
+// The parser must extract model references from allowlisted loader nodes,
+// enumerating every model-name field per node (the research doc's table).
+func TestModelReferencesExtractsCheckpointLoader(t *testing.T) {
+	body := []byte(`{
+		"client_id": "abc",
+		"prompt": {
+			"4": {
+				"class_type": "CheckpointLoaderSimple",
+				"inputs": {"ckpt_name": "sd_xl_base_1.0.safetensors"}
+			}
+		}
+	}`)
+
+	g, err := Parse(body)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+
+	refs := g.ModelReferences(DefaultAllowlist)
+	if len(refs) != 1 {
+		t.Fatalf("want 1 model ref, got %d: %+v", len(refs), refs)
+	}
+	got := refs[0]
+	if got.NodeID != "4" || got.ClassType != "CheckpointLoaderSimple" ||
+		got.Field != "ckpt_name" || got.Filename != "sd_xl_base_1.0.safetensors" ||
+		got.Folder != "checkpoints" {
+		t.Fatalf("unexpected ref: %+v", got)
+	}
+}
+
+// Default-deny: a workflow containing any non-allowlisted class_type is rejected
+// before execution — the single check that closes the loader-smuggle AND
+// saver-escape blind spots.
+func TestValidateRejectsUnknownClassType(t *testing.T) {
+	g, err := Parse([]byte(`{"prompt":{
+		"4": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": "ok.safetensors"}},
+		"5": {"class_type": "EvilCustomLoaderNode", "inputs": {}}
+	}}`))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if err := g.Validate(DefaultAllowlist); err == nil {
+		t.Fatal("workflow with a non-allowlisted class_type must be rejected")
+	}
+}
+
+// The ComfyUI model-writer save nodes (CheckpointSave, LoraSave, …) are a real
+// escape vector (they write model files). They are NOT on the allowlist, so
+// Validate rejects them — defense-in-depth alongside the RO model store.
+func TestValidateRejectsModelWriterEscapeVector(t *testing.T) {
+	for _, ct := range []string{"CheckpointSave", "LoraSave", "ModelSave", "VAESave", "SaveImageWebsocket"} {
+		g := &Graph{Nodes: map[string]Node{"1": {ClassType: ct, Inputs: map[string]any{}}}}
+		if err := g.Validate(DefaultAllowlist); err == nil {
+			t.Errorf("%s must be rejected by default-deny", ct)
+		}
+	}
+}
+
+// A standard SDXL text2img workshop graph uses only allowlisted nodes → passes.
+func TestValidateAllowsStandardWorkshopGraph(t *testing.T) {
+	g, err := Parse([]byte(`{"prompt":{
+		"4": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": "sdxl.safetensors"}},
+		"5": {"class_type": "CLIPTextEncode", "inputs": {"text": "a cat"}},
+		"6": {"class_type": "CLIPTextEncode", "inputs": {"text": "blurry"}},
+		"7": {"class_type": "EmptyLatentImage", "inputs": {"width": 1024, "height": 1024}},
+		"8": {"class_type": "KSampler", "inputs": {"seed": 1}},
+		"9": {"class_type": "VAEDecode", "inputs": {}},
+		"10": {"class_type": "SaveImage", "inputs": {"filename_prefix": "out"}}
+	}}`))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if err := g.Validate(DefaultAllowlist); err != nil {
+		t.Fatalf("standard workshop graph should validate: %v", err)
+	}
+}

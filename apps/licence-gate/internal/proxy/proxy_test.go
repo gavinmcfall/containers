@@ -23,11 +23,13 @@ import (
 // tests can assert the request was gated/rewritten before it reached upstream.
 type fakeComfy struct {
 	mu             sync.Mutex
-	promptCalls    int
-	lastPromptBody []byte
-	viewCalls      int
-	historyJSON    string
-	queueJSON      string
+	promptCalls         int
+	lastPromptBody      []byte
+	distributedCalls    int
+	lastDistributedBody []byte
+	viewCalls           int
+	historyJSON         string
+	queueJSON           string
 	// view: filenames that "exist"; anything else → upstream 404.
 	existingViews map[string]bool
 }
@@ -57,6 +59,15 @@ func (f *fakeComfy) handler() http.Handler {
 		// canonical 404, so the test proves the proxy normalises it.
 		w.WriteHeader(http.StatusNotFound)
 		io.WriteString(w, `{"comfy":"file not found, distinct body"}`)
+	})
+	mux.HandleFunc("/distributed/queue", func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		f.mu.Lock()
+		f.distributedCalls++
+		f.lastDistributedBody = body
+		f.mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"prompt_id":"pid-dq","worker_count":2,"auto_prepare_supported":true}`)
 	})
 	mux.HandleFunc("/history", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -396,6 +407,75 @@ func TestQueueFilteredToOwner(t *testing.T) {
 	}
 	if len(got.Pending) != 0 {
 		t.Errorf("other user's pending entry leaked: %+v", got.Pending)
+	}
+}
+
+// distributedBody wraps the same SDXL graph in a /distributed/queue envelope
+// (the ComfyUI-Distributed GPU render path) — extra fields beyond /prompt.
+func distributedBody(ckpt, prefix, clientID string) []byte {
+	var env map[string]any
+	_ = json.Unmarshal(promptBody(ckpt, prefix, clientID), &env)
+	env["enabled_worker_ids"] = []string{"gpu-vengeance", "gpu-vixen"}
+	env["delegate_master"] = true
+	b, _ := json.Marshal(env)
+	return b
+}
+
+// The GPU render path (/distributed/queue) MUST be gated exactly like /prompt —
+// otherwise a render bypasses the licence gate by using the distributed endpoint.
+func TestDistributedQueueRejectsNonCommercial(t *testing.T) {
+	fc := &fakeComfy{}
+	p, _, auditBuf, _ := newTestProxy(t, fc, []registry.Entry{
+		{Filename: "anime_nc.safetensors", CommercialOK: false, Substitutes: []string{"sdxl_base.safetensors"}},
+	})
+	req := httptest.NewRequest(http.MethodPost, "/distributed/queue", bytes.NewReader(distributedBody("anime_nc.safetensors", "render", "c1")))
+	req.Header.Set("Authorization", "Bearer "+makeJWT("gavin", "family-adult"))
+	rec := do(p, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403 (distributed path must be gated)", rec.Code)
+	}
+	if fc.distributedCalls != 0 {
+		t.Errorf("rejected distributed job must NOT reach upstream, calls=%d", fc.distributedCalls)
+	}
+	if recs := auditLines(t, auditBuf); len(recs) != 1 || recs[0].Decision != "reject" {
+		t.Errorf("audit = %+v, want one reject record", recs)
+	}
+}
+
+func TestDistributedQueueAllowedRewritesAndRemembers(t *testing.T) {
+	fc := &fakeComfy{}
+	p, _, _, owners := newTestProxy(t, fc, []registry.Entry{
+		{Filename: "sdxl_base.safetensors", CommercialOK: true},
+	})
+	req := httptest.NewRequest(http.MethodPost, "/distributed/queue", bytes.NewReader(distributedBody("sdxl_base.safetensors", "render", "c1")))
+	req.Header.Set("Authorization", "Bearer "+makeJWT("gavin", "family-adult"))
+	rec := do(p, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if fc.distributedCalls != 1 {
+		t.Fatalf("upstream distributed calls = %d, want 1", fc.distributedCalls)
+	}
+	// Output scoped to the user, AND the distributed-only fields preserved.
+	var fwd struct {
+		ClientID         string                   `json:"client_id"`
+		EnabledWorkerIDs []string                 `json:"enabled_worker_ids"`
+		DelegateMaster   bool                     `json:"delegate_master"`
+		Prompt           map[string]workflow.Node `json:"prompt"`
+	}
+	if err := json.Unmarshal(fc.lastDistributedBody, &fwd); err != nil {
+		t.Fatalf("forwarded body invalid: %v", err)
+	}
+	if got := fwd.Prompt["6"].Inputs["filename_prefix"]; got != "gavin/render" {
+		t.Errorf("filename_prefix = %v, want gavin/render", got)
+	}
+	if len(fwd.EnabledWorkerIDs) != 2 || !fwd.DelegateMaster {
+		t.Errorf("distributed envelope fields not preserved: %+v", fwd)
+	}
+	if u, known := owners.Owner("pid-dq"); !known || u != "gavin" {
+		t.Errorf("owner of pid-dq = %q known=%v, want gavin/true", u, known)
 	}
 }
 

@@ -65,7 +65,12 @@ func New(cfg Config) *Proxy {
 
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch {
-	case r.Method == http.MethodPost && r.URL.Path == "/prompt":
+	// Both the plain (/prompt) and the ComfyUI-Distributed GPU render path
+	// (/distributed/queue) carry the workflow graph under "prompt" and return a
+	// prompt_id — so both go through the same gate→rewrite→remember→audit
+	// pipeline. Gating only /prompt would let a render bypass the licence gate by
+	// using the distributed endpoint.
+	case r.Method == http.MethodPost && (r.URL.Path == "/prompt" || r.URL.Path == "/distributed/queue"):
 		p.handlePrompt(w, r)
 	case r.Method == http.MethodGet && r.URL.Path == "/view":
 		p.handleView(w, r)

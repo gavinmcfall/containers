@@ -6,7 +6,7 @@ variable "APP" {
 
 variable "VERSION" {
   // First-party app — semver bumped by hand on release (no upstream datasource).
-  default = "0.1.0"
+  default = "0.1.1"
 }
 
 variable "SOURCE" {

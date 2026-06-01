@@ -84,6 +84,23 @@ files (an escape vector). All non-image savers are blocked by the allowlist
 `SaveImageWebsocket` has no file field (WS-only; WS progress scoping is a deferred
 Phase-1 known-gap).
 
+## The GPU render path is `/distributed/queue`, NOT just `/prompt` (verified 2026-06-01, v0.1.1)
+
+ComfyUI-Distributed only dispatches a render to remote GPU workers when the
+workflow contains a `DistributedCollector` node AND the request hits the plugin's
+**custom endpoint `POST /distributed/queue`** (`api/job_routes.py:206` →
+`orchestrate_distributed_execution`). A plain `POST /prompt` runs the whole graph
+locally on the master (which is `--cpu`). The `/distributed/queue` body carries
+the same graph under `"prompt"` (plus `client_id`, `enabled_worker_ids`,
+`delegate_master`) and returns a `prompt_id` — so the proxy routes BOTH `/prompt`
+and `/distributed/queue` through the identical gate→rewrite→remember→audit
+pipeline. **Gating only `/prompt` would let any authenticated caller bypass the
+licence gate + output isolation by using the distributed endpoint** — that was a
+real hole, closed in v0.1.1 (`TestDistributedQueue*`). The node allowlist must
+also permit `DistributedCollector` (+ `DistributedSeed`) or Validate rejects the
+distributed workflow — delivered via the mounted allowlist ConfigMap, not the
+built-in default.
+
 ## Auth is DECODE-ONLY — load-bearing on two upstream guarantees (Chat A review note, 2026-06-01)
 
 `identity.ParseAuth` **decodes** the Pocket-ID JWT for claims (sub/email/groups);

@@ -235,3 +235,45 @@ func TestIngestRequiresToken(t *testing.T) {
 		t.Fatalf("wrong token → %d, want 401", rec.Code)
 	}
 }
+
+// gatedOriginServer returns body only when the request carries the expected
+// Authorization header; otherwise responds 401. Stands in for HuggingFace
+// gated repos / private registries.
+func gatedOriginServer(t *testing.T, body []byte, expectedAuth string) *httptest.Server {
+	t.Helper()
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != expectedAuth {
+			http.Error(w, "gated", http.StatusUnauthorized)
+			return
+		}
+		w.Write(body)
+	}))
+	t.Cleanup(s.Close)
+	return s
+}
+
+func TestIngestForwardsAuthHeaderToSource(t *testing.T) {
+	h, root := setup(t, "worker-secret")
+	payload := []byte("THE-GATED-WEIGHTS")
+	origin := gatedOriginServer(t, payload, "Bearer hf_test_token")
+
+	// Without auth → source returns 401, model-serve returns 502.
+	noAuth := `{"url":"` + origin.URL + `","dest":"checkpoints/gated.bin"}`
+	if rec := postIngest(h, "worker-secret", noAuth); rec.Code != http.StatusBadGateway {
+		t.Fatalf("gated source without auth → %d, want 502", rec.Code)
+	}
+	if _, err := os.Stat(filepath.Join(root, "checkpoints", "gated.bin")); !os.IsNotExist(err) {
+		t.Errorf("failed gated fetch must not leave a file")
+	}
+
+	// With auth → source returns body, model-serve stores it.
+	withAuth := `{"url":"` + origin.URL + `","dest":"checkpoints/gated.bin","auth":"Bearer hf_test_token"}`
+	rec := postIngest(h, "worker-secret", withAuth)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("gated source with correct auth → %d, want 200 (%s)", rec.Code, rec.Body.String())
+	}
+	got, err := os.ReadFile(filepath.Join(root, "checkpoints", "gated.bin"))
+	if err != nil || string(got) != string(payload) {
+		t.Fatalf("stored file wrong: err=%v got=%q", err, got)
+	}
+}

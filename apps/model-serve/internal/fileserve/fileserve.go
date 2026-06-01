@@ -5,8 +5,10 @@
 //   - GET  /models/<path>     stream a model to a GPU worker (range-resumable;
 //     workers verify sha256 their side — no hashing on this hot path).
 //   - POST /models/ingest     download a model server-side into the store
-//     ({url, dest, sha256?}); streams to a temp file, optionally verifies the
-//     sha256, atomically renames into place, and returns the computed sha256.
+//     ({url, dest, sha256?, auth?}); streams to a temp file, optionally verifies
+//     the sha256, atomically renames into place, and returns the computed sha256.
+//     The optional auth field is forwarded verbatim as the Authorization header
+//     on the source fetch (HuggingFace gated repos etc.).
 //     This is the sustainable ingestion path — no shell/exec/scale-down (works
 //     in the distroless image because the Go binary does the fetch itself).
 package fileserve
@@ -116,11 +118,16 @@ func serveModel(w http.ResponseWriter, r *http.Request, absRoot string) {
 }
 
 // ingestReq is the POST /models/ingest body: pull <url> into <dest> (relative to
-// the store root), optionally verifying <sha256>.
+// the store root), optionally verifying <sha256>. If <auth> is set, it is sent
+// verbatim as the Authorization header on the source fetch — supports gated
+// upstreams (HuggingFace "Bearer hf_…", private registries, etc.). The value
+// is forwarded unmodified, so callers control the scheme ("Bearer …", "Token …",
+// "Basic …" — whatever the source expects).
 type ingestReq struct {
 	URL    string `json:"url"`
 	Dest   string `json:"dest"`
 	SHA256 string `json:"sha256,omitempty"`
+	Auth   string `json:"auth,omitempty"`
 }
 
 type ingestResp struct {
@@ -156,7 +163,15 @@ func ingestModel(w http.ResponseWriter, r *http.Request, absRoot string) {
 		return
 	}
 
-	resp, err := http.Get(req.URL)
+	freq, err := http.NewRequestWithContext(r.Context(), http.MethodGet, req.URL, nil)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("build source request: %v", err), http.StatusBadRequest)
+		return
+	}
+	if req.Auth != "" {
+		freq.Header.Set("Authorization", req.Auth)
+	}
+	resp, err := http.DefaultClient.Do(freq)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("fetch source: %v", err), http.StatusBadGateway)
 		return

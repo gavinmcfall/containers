@@ -25,6 +25,7 @@ type fakeComfy struct {
 	mu             sync.Mutex
 	promptCalls         int
 	lastPromptBody      []byte
+	lastPromptOrigin    string
 	distributedCalls    int
 	lastDistributedBody []byte
 	viewCalls           int
@@ -41,6 +42,7 @@ func (f *fakeComfy) handler() http.Handler {
 		f.mu.Lock()
 		f.promptCalls++
 		f.lastPromptBody = body
+		f.lastPromptOrigin = r.Header.Get("Origin")
 		f.mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
 		io.WriteString(w, `{"prompt_id":"pid-123","number":1,"node_errors":{}}`)
@@ -476,6 +478,37 @@ func TestDistributedQueueAllowedRewritesAndRemembers(t *testing.T) {
 	}
 	if u, known := owners.Owner("pid-dq"); !known || u != "gavin" {
 		t.Errorf("owner of pid-dq = %q known=%v, want gavin/true", u, known)
+	}
+}
+
+// TestForwardStripsOriginHeader verifies that the proxy strips the Origin
+// header before forwarding to upstream. Required because ComfyUI master has
+// built-in DNS-rebinding protection that returns 403 when the browser-set
+// Origin doesn't match the upstream Host (which the proxy rewrites to
+// 127.0.0.1:8188 on forward). Without this strip, every browser-originated
+// request fails with HTTP 403 + master log "request with non matching host
+// and origin ..., returning 403". Discovered Lighthouse smoke 2026-06-03.
+func TestForwardStripsOriginHeader(t *testing.T) {
+	fc := &fakeComfy{}
+	p, fc, _, _ := newTestProxy(t, fc, []registry.Entry{
+		{Filename: "sdxl_base.safetensors", CommercialOK: true, Licence: "OK"},
+	})
+	req := httptest.NewRequest(http.MethodPost, "/prompt", bytes.NewReader(promptBody("sdxl_base.safetensors", "x", "c1")))
+	req.Header.Set("Authorization", "Bearer "+makeJWT("user-a"))
+	// Simulate the browser-set Origin that would otherwise reach master and trip
+	// its DNS-rebinding defense.
+	req.Header.Set("Origin", "https://lighthouse.nerdz.cloud")
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK from forwarded prompt, got %d (body=%s)", rec.Code, rec.Body.String())
+	}
+	if fc.promptCalls != 1 {
+		t.Fatalf("expected upstream /prompt called once, got %d", fc.promptCalls)
+	}
+	if fc.lastPromptOrigin != "" {
+		t.Errorf("Origin should be STRIPPED before upstream; got %q (would trigger master 403)", fc.lastPromptOrigin)
 	}
 }
 

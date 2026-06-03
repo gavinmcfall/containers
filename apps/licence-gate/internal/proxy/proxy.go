@@ -291,6 +291,15 @@ func (p *Proxy) forward(r *http.Request, body []byte) (*http.Response, error) {
 		return nil, err
 	}
 	copyHeader(req.Header, r.Header)
+	// ComfyUI has built-in DNS-rebinding protection that returns 403 when the
+	// browser-set Origin doesn't match the upstream Host. Behind a reverse proxy,
+	// the proxy rewrites Host (to upstream loopback) but Origin would otherwise
+	// pass through unchanged — causing every browser-originated request to be
+	// rejected. Strip Origin on forward so the upstream sees a same-origin
+	// request (its own Host). Discovered Lighthouse smoke 2026-06-03 — curl tests
+	// pass (Origin empty), browser-via-OIDC fails (Origin=public-URL) with master
+	// log line "request with non matching host and origin ..., returning 403".
+	req.Header.Del("Origin")
 	if body != nil {
 		req.ContentLength = int64(len(body))
 		req.Header.Set("Content-Type", "application/json")

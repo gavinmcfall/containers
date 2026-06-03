@@ -32,8 +32,15 @@ RUN set -eux; \
     apt-get install -y --no-install-recommends \
         ca-certificates \
         git \
+        patch \
         tini; \
     rm -rf /var/lib/apt/lists/*
+
+# Vendor patches applied to pinned upstream during build. Patch directory pinned
+# in this repo (containers/apps/lighthouse/patches/) so changes are explicit,
+# reviewable, and CI fails loudly if a patch stops applying after an upstream
+# version bump. See specific patch headers for context + upstream PR status.
+COPY patches /patches
 
 # ComfyUI core (pinned tag). CPU-only torch installed FIRST so ComfyUI's unpinned
 # `torch` requirement resolves to the already-present CPU build (no CUDA pull).
@@ -52,6 +59,15 @@ RUN set -eux; \
     git clone https://github.com/robertvoy/ComfyUI-Distributed.git \
         custom_nodes/ComfyUI-Distributed; \
     git -C custom_nodes/ComfyUI-Distributed checkout "${DISTRIBUTED_REF}"; \
+    # Vendor patches applied to ComfyUI-Distributed. If a patch stops applying
+    # cleanly after a DISTRIBUTED_REF bump, this RUN step fails loudly — that's
+    # the signal to rebase the patch against the new upstream version.
+    for p in /patches/*.patch; do \
+        if [ -f "$p" ]; then \
+            echo "applying $p"; \
+            patch -p1 --directory=custom_nodes/ComfyUI-Distributed --no-backup-if-mismatch < "$p"; \
+        fi; \
+    done; \
     for d in custom_nodes/*/; do \
         if [ -f "$d/requirements.txt" ]; then pip install -r "$d/requirements.txt"; fi; \
     done; \

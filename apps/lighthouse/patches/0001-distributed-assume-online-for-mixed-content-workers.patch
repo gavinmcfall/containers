@@ -1,0 +1,56 @@
+From: Gavin McFall (Lighthouse) <gavin@nerdz.co.nz>
+Subject: [PATCH] distributed: assume-online for mixed-content worker probes
+
+ComfyUI-Distributed's UI probes worker status by direct HTTP fetch from the
+browser. In cluster deployments (Lighthouse), the page is served over HTTPS
+via the proxy (https://lighthouse.nerdz.cloud) but workers are LAN-only HTTP
+(http://vengeancepc.internal:8188). The browser blocks ALL such probes as
+mixed-content; the UI then thinks workers are offline forever and falls back
+to master-only execution via /prompt — silently downgrading dispatch to a
+CPU-master render path the user never asked for.
+
+This patch makes probeWorker return assume-online when it detects the
+mixed-content scenario (HTTPS page + HTTP worker URL). Justification:
+- Server-side orchestration in /distributed/queue does a real probe at
+  dispatch time and reports worker_count accurately
+- If a worker is genuinely offline, master's dispatch returns worker_count=0
+  and the UI surfaces that error inline
+- The UI's display state is therefore informational; the source of truth is
+  the server-side probe at queue time
+
+Upstream-friendly: only changes behaviour in the mixed-content edge case
+(HTTPS page + HTTP worker), which is a deployment configuration the plugin
+upstream doesn't currently support. Same-origin/non-mixed-content probes
+(e.g. master probing itself, single-machine deployments) are unaffected.
+
+Lighthouse memory: comfyui-distributed-symmetric-install.md (sibling section
+"Distributed-panel status is stale, not real-time")
+Lighthouse PR context: Plan-1b cluster UX completion 2026-06-03
+
+---
+ web/apiClient.js | 13 +++++++++++++
+ 1 file changed, 13 insertions(+)
+
+diff --git a/web/apiClient.js b/web/apiClient.js
+--- a/web/apiClient.js
++++ b/web/apiClient.js
+@@ -161,6 +161,19 @@
+
+         async probeWorker(workerUrl, timeoutMs = TIMEOUTS.STATUS_CHECK, signal = null) {
+             const normalizedWorkerUrl = normalizeWorkerUrl(workerUrl);
++            // LIGHTHOUSE PATCH: in cluster deployments the page is HTTPS but worker URLs
++            // are LAN-only HTTP — browser blocks the probe as mixed-content. The
++            // orchestration probe in /distributed/queue runs server-side and is the
++            // source of truth for dispatchability; this UI probe is informational only.
++            // Returning assume-online here makes the UI route requests through
++            // /distributed/queue (correct path); if a worker is genuinely offline,
++            // master's dispatch surfaces that as worker_count=0 in the response.
++            // Same-origin probes (master probing itself, single-machine deployments
++            // where worker URLs are HTTP and page is HTTP) are unaffected.
++            if (typeof window !== 'undefined' && window.location.protocol === 'https:'
++                && normalizedWorkerUrl.startsWith('http://')) {
++                return { ok: true, status: 200, queueRemaining: 0 };
++            }
+             const controller = new AbortController();
+             const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+             const effectiveSignal = signal

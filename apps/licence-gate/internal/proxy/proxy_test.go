@@ -97,7 +97,22 @@ func (f *fakeComfy) handler() http.Handler {
 		w.Header().Set("Content-Type", "text/plain")
 		io.WriteString(w, "ok")
 	})
-	return mux
+	// Mirror real master: every route is also served under /api (server.py
+	// registers "/api"+route.path for all routes). Strip a leading /api segment
+	// before dispatching so the fake answers /api/prompt, /api/view, /api/userdata,
+	// … exactly as master does. r.URL.RawPath is preserved for the userdata capture.
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api" {
+			r.URL.Path = "/"
+			r.URL.RawPath = ""
+		} else if strings.HasPrefix(r.URL.Path, "/api/") {
+			r.URL.Path = strings.TrimPrefix(r.URL.Path, "/api")
+			if r.URL.RawPath != "" {
+				r.URL.RawPath = strings.TrimPrefix(r.URL.RawPath, "/api")
+			}
+		}
+		mux.ServeHTTP(w, r)
+	})
 }
 
 func (f *fakeComfy) captureUserdata(r *http.Request) {
@@ -623,6 +638,66 @@ func TestUserdataEnvoyDecodedSlashStillScopes(t *testing.T) {
 	want := "/userdata/gavin%2Fworkflows%2FTest%20Flow.json"
 	if fc.lastUserdataRawPath != want {
 		t.Errorf("Envoy-decoded inbound: upstream saw EscapedPath=%q, want %q", fc.lastUserdataRawPath, want)
+	}
+}
+
+// ── /api prefix routing (Lighthouse Plan-1b HAR 2026-06-04) ──
+// The web frontend prepends /api to every native call. Matching only the bare
+// path let EVERY browser request fall through to passthrough — bypassing the
+// licence gate (/api/prompt) and per-user isolation (/api/userdata, /api/view).
+// These tests pin that the gated handlers fire on the /api spelling too.
+
+func TestUserdataApiPrefixScopes(t *testing.T) {
+	// The exact 405 case from the HAR: browser POST to /api/userdata/<%2F-path>.
+	// Must reach handleUserdata (not passthrough) and inject the caller's bucket.
+	fc := &fakeComfy{}
+	p, _, _, _ := newTestProxy(t, fc, nil)
+	req := httptest.NewRequest(http.MethodPost, "/api/userdata/workflows%2FTest%20Realvisxl.json?overwrite=false",
+		strings.NewReader(`{"x":1}`))
+	req.Header.Set("Authorization", "Bearer "+makeJWT("gavin"))
+	req.Header.Set("Content-Type", "application/json")
+	rec := do(p, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("/api/userdata save status = %d body=%q", rec.Code, rec.Body.String())
+	}
+	// fakeComfy strips /api before capture (mirrors master); the bucket prefix is
+	// what proves handleUserdata fired rather than passthrough.
+	if !strings.Contains(fc.lastUserdataRawPath, "gavin%2Fworkflows%2FTest%20Realvisxl.json") {
+		t.Errorf("/api/userdata not scoped — handler bypassed? upstream saw %q", fc.lastUserdataRawPath)
+	}
+}
+
+func TestPromptApiPrefixGated(t *testing.T) {
+	// /api/prompt must hit the licence gate. A non-commercial model on a brand
+	// (service) identity is rejected — proving the gate ran on the /api spelling.
+	fc := &fakeComfy{}
+	p, _, _, _ := newTestProxy(t, fc, []registry.Entry{
+		{Filename: "anime_nc.safetensors", Licence: "CreativeML-NC", CommercialOK: false},
+	})
+	req := httptest.NewRequest(http.MethodPost, "/api/prompt", bytes.NewReader(promptBody("anime_nc.safetensors", "render", "c1")))
+	req.Header.Set("Authorization", "Bearer "+makeJWT("gavin", "family-adult"))
+	rec := do(p, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("/api/prompt non-commercial status = %d, want 403 (gate must fire on /api)", rec.Code)
+	}
+	if fc.promptCalls != 0 {
+		t.Errorf("rejected /api/prompt must NOT reach upstream, calls=%d", fc.promptCalls)
+	}
+}
+
+func TestViewApiPrefixScoped(t *testing.T) {
+	// /api/view for another user's bucket must be denied with the canonical 404,
+	// proving view-scoping fires on the /api spelling (else cross-user image read).
+	fc := &fakeComfy{existingViews: map[string]bool{}}
+	p, _, _, _ := newTestProxy(t, fc, nil)
+	req := httptest.NewRequest(http.MethodGet, "/api/view?filename=secret.png&subfolder=alice&type=output", nil)
+	req.Header.Set("Authorization", "Bearer "+makeJWT("gavin"))
+	rec := do(p, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("/api/view cross-user status = %d, want 404", rec.Code)
+	}
+	if fc.viewCalls != 0 {
+		t.Errorf("denied /api/view must NOT reach upstream, calls=%d", fc.viewCalls)
 	}
 }
 

@@ -15,11 +15,21 @@ const userdataPrefix = "/userdata"
 // the userdata path, so caller A's "workflows/foo.json" becomes "A/workflows/foo.json"
 // from master's perspective; caller B never sees A's files.
 //
-// Preserves URL encoding (specifically %2F-encoded slashes that ComfyUI's frontend
-// uses to pack multi-segment paths into the single {file} route parameter).
-// Without preservation, Go's httputil reverse proxy decodes %2F→/, master sees the
-// path as multi-segment, master returns 405 because the POST route is /userdata/{file}
-// (single segment) — Lighthouse Plan-1b 2026-06-03 smoke surfaced this.
+// ComfyUI's frontend packs multi-segment paths into the single {file} route
+// parameter using %2F-encoded slashes (e.g. "workflows%2Ffoo.json"). master's
+// route is /userdata/{file} — a SINGLE segment — so the whole file path must
+// reach master as one %2F-encoded segment or it returns 405/404 (route mismatch).
+//
+// CRITICAL: this rewrite must NOT assume the inbound %2F survived. HTTP
+// intermediaries are allowed to normalize %2F→/ (RFC 3986 §2.2 treats them as
+// equivalent in some contexts). Envoy Gateway in particular runs
+// path_with_escaped_slashes_action=UNESCAPE_AND_REDIRECT by default, so by the
+// time a browser request reaches this proxy the %2F is already a literal slash.
+// We therefore work on the FULLY DECODED logical path and re-encode the entire
+// file path as one segment (url.PathEscape maps /→%2F). This produces the
+// identical, correct single-segment result whether the inbound path arrived
+// encoded (curl/internal) or decoded (browser via Envoy). Lighthouse Plan-1b
+// 2026-06-04 smoke surfaced the decoded-slash case as a 405-on-save.
 //
 // Handles the four ComfyUI userdata route shapes:
 //   - GET /userdata                          (listing; rewrite ?dir= query param)
@@ -75,35 +85,41 @@ func rewriteListingQuery(user string, out *url.URL) (*url.URL, error) {
 }
 
 // rewriteFileEndpoint handles /userdata/{file} and /userdata/{file}/move/{dest}.
-// Operates on the EscapedPath so %2F-encoded segment separators survive forward.
+// Works on EscapedPath to find the structural /move/ literal, then scopeSegment
+// decodes each part fully and re-encodes it as one segment — so the result is
+// correct whether the inbound file slashes arrived as %2F or as literal /.
 func rewriteFileEndpoint(user string, rawPath string, out *url.URL) (*url.URL, error) {
 	suffix := rawPath[len(userdataPrefix+"/"):] // everything after "/userdata/"
 	if suffix == "" {
 		return nil, fmt.Errorf("empty file segment after /userdata/")
 	}
 
-	// Detect the move sub-route. The /move/ separator uses real slashes because
-	// it's a literal in master's route pattern, NOT part of the {file} value.
+	// Detect the move sub-route. The /move/ separator is a LITERAL in master's
+	// route pattern, not part of {file}. In the encoded case the file's own
+	// slashes are %2F, so the only literal "/move/" is structural — unambiguous.
+	// In the decoded case (Envoy already unescaped) we split on the first
+	// "/move/"; a userdata filename literally containing "/move/" is pathological
+	// and outside ComfyUI's behaviour.
 	if i := strings.Index(suffix, "/move/"); i >= 0 {
-		filePart := suffix[:i]
-		destPart := suffix[i+len("/move/"):]
-		if err := validateEncodedSegment(filePart); err != nil {
+		fileSeg, err := scopeSegment(user, suffix[:i])
+		if err != nil {
 			return nil, fmt.Errorf("file segment: %w", err)
 		}
-		if err := validateEncodedSegment(destPart); err != nil {
+		destSeg, err := scopeSegment(user, suffix[i+len("/move/"):])
+		if err != nil {
 			return nil, fmt.Errorf("dest segment: %w", err)
 		}
-		out.RawPath = userdataPrefix + "/" + url.PathEscape(user) + "%2F" + filePart +
-			"/move/" + url.PathEscape(user) + "%2F" + destPart
+		out.RawPath = userdataPrefix + "/" + fileSeg + "/move/" + destSeg
 	} else {
-		if err := validateEncodedSegment(suffix); err != nil {
+		fileSeg, err := scopeSegment(user, suffix)
+		if err != nil {
 			return nil, fmt.Errorf("file segment: %w", err)
 		}
-		out.RawPath = userdataPrefix + "/" + url.PathEscape(user) + "%2F" + suffix
+		out.RawPath = userdataPrefix + "/" + fileSeg
 	}
 
-	// Set decoded Path too, for consistency. The HTTP client/server pair prefers
-	// RawPath when set; Path is the fallback for round-trip safety.
+	// Set decoded Path too. The HTTP client prefers RawPath when set; Path is the
+	// round-trip fallback.
 	decoded, err := url.PathUnescape(out.RawPath)
 	if err != nil {
 		return nil, fmt.Errorf("decoded path malformed: %w", err)
@@ -112,14 +128,21 @@ func rewriteFileEndpoint(user string, rawPath string, out *url.URL) (*url.URL, e
 	return out, nil
 }
 
-// validateEncodedSegment rejects unsafe content in a still-URL-encoded path segment.
-// Decodes once before checking so encoded traversal (%2E%2E) is caught.
-func validateEncodedSegment(s string) error {
-	decoded, err := url.PathUnescape(s)
+// scopeSegment turns a single userdata file path (which may carry its internal
+// directory separators as %2F OR as already-decoded literal /) into one
+// master-ready segment: <user>/<path> percent-encoded so every / becomes %2F.
+// It fully decodes first (so validation sees the real path and both encodings
+// converge), rejects unsafe content, then re-encodes the whole thing as one
+// segment via url.PathEscape (which escapes / to %2F).
+func scopeSegment(user, part string) (string, error) {
+	decoded, err := url.PathUnescape(part)
 	if err != nil {
-		return fmt.Errorf("malformed URL encoding: %w", err)
+		return "", fmt.Errorf("malformed URL encoding: %w", err)
 	}
-	return validateDecodedSegment(decoded)
+	if err := validateDecodedSegment(decoded); err != nil {
+		return "", err
+	}
+	return url.PathEscape(user + "/" + decoded), nil
 }
 
 // validateDecodedSegment is the common safety check after decoding (or for

@@ -191,3 +191,69 @@ func TestRewriteUserdataURL_UUIDUserCommonCase(t *testing.T) {
 		t.Errorf("UUID user case: got %q, want %q", got.EscapedPath(), want)
 	}
 }
+
+// ── Envoy UNESCAPE_AND_REDIRECT regression (Lighthouse Plan-1b 2026-06-04) ──
+// Envoy Gateway decodes %2F→/ before the request reaches the proxy, so the
+// inbound path carries LITERAL slashes where the frontend sent %2F. The rewrite
+// must still produce a single %2F-encoded segment for master's /userdata/{file}
+// route. Without the decoded-slash handling these all 405 on save.
+
+// envoyDecoded builds the URL shape Go's http.Server produces for a path Envoy
+// has already unescaped: literal / between dirs, other reserved chars still
+// percent-encoded (e.g. spaces as %20). RawPath retains the partial encoding.
+func envoyDecoded(t *testing.T, path, rawPath string) *url.URL {
+	t.Helper()
+	return &url.URL{Path: path, RawPath: rawPath}
+}
+
+func TestRewriteUserdataURL_EnvoyDecodedSingleFile(t *testing.T) {
+	in := envoyDecoded(t, "/userdata/workflows/Test Flow.json", "/userdata/workflows/Test%20Flow.json")
+	got, err := RewriteUserdataURL("alice", in)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := "/userdata/alice%2Fworkflows%2FTest%20Flow.json"
+	if got.EscapedPath() != want {
+		t.Errorf("Envoy-decoded save: got %q, want %q", got.EscapedPath(), want)
+	}
+}
+
+func TestRewriteUserdataURL_EnvoyDecodedMatchesEncoded(t *testing.T) {
+	// The headline invariant: encoded (curl/internal) and Envoy-decoded (browser)
+	// inputs for the SAME logical file must yield the IDENTICAL master path.
+	encoded := mustURL(t, "/userdata/workflows%2FTest%20Flow.json")
+	decoded := envoyDecoded(t, "/userdata/workflows/Test Flow.json", "/userdata/workflows/Test%20Flow.json")
+	gotEnc, err := RewriteUserdataURL("alice", encoded)
+	if err != nil {
+		t.Fatalf("encoded: %v", err)
+	}
+	gotDec, err := RewriteUserdataURL("alice", decoded)
+	if err != nil {
+		t.Fatalf("decoded: %v", err)
+	}
+	if gotEnc.EscapedPath() != gotDec.EscapedPath() {
+		t.Errorf("encoding-invariance broken:\n encoded -> %q\n decoded -> %q", gotEnc.EscapedPath(), gotDec.EscapedPath())
+	}
+}
+
+func TestRewriteUserdataURL_EnvoyDecodedMove(t *testing.T) {
+	in := envoyDecoded(t,
+		"/userdata/workflows/a.json/move/workflows/b.json",
+		"/userdata/workflows/a.json/move/workflows/b.json")
+	got, err := RewriteUserdataURL("alice", in)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := "/userdata/alice%2Fworkflows%2Fa.json/move/alice%2Fworkflows%2Fb.json"
+	if got.EscapedPath() != want {
+		t.Errorf("Envoy-decoded move: got %q, want %q", got.EscapedPath(), want)
+	}
+}
+
+func TestRewriteUserdataURL_EnvoyDecodedTraversalRejected(t *testing.T) {
+	// Decoded traversal must still be caught (Envoy already unescaped %2E%2E%2F).
+	in := envoyDecoded(t, "/userdata/../etc/passwd", "/userdata/../etc/passwd")
+	if _, err := RewriteUserdataURL("alice", in); err == nil {
+		t.Error("decoded traversal accepted; want rejection")
+	}
+}

@@ -603,6 +603,29 @@ func TestUserdataPreservesEncodedSlashThroughForward(t *testing.T) {
 	}
 }
 
+func TestUserdataEnvoyDecodedSlashStillScopes(t *testing.T) {
+	// The PRODUCTION case: Envoy Gateway runs UNESCAPE_AND_REDIRECT, so the
+	// browser's POST /userdata/workflows%2FTest%20Flow.json arrives at this proxy
+	// already decoded to a LITERAL slash: /userdata/workflows/Test%20Flow.json.
+	// httptest.NewRequest reproduces that shape (Path decoded, RawPath partial).
+	// The rewrite must still hand master ONE %2F-segment or master 405s on save.
+	// Lighthouse Plan-1b 2026-06-04 — this is what the v0.1.3 encoded-only code missed.
+	fc := &fakeComfy{}
+	p, _, _, _ := newTestProxy(t, fc, nil)
+	req := httptest.NewRequest(http.MethodPost, "/userdata/workflows/Test%20Flow.json?overwrite=true",
+		strings.NewReader(`{"x":1}`))
+	req.Header.Set("Authorization", "Bearer "+makeJWT("gavin"))
+	req.Header.Set("Content-Type", "application/json")
+	rec := do(p, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d body=%q", rec.Code, rec.Body.String())
+	}
+	want := "/userdata/gavin%2Fworkflows%2FTest%20Flow.json"
+	if fc.lastUserdataRawPath != want {
+		t.Errorf("Envoy-decoded inbound: upstream saw EscapedPath=%q, want %q", fc.lastUserdataRawPath, want)
+	}
+}
+
 func TestUserdataListingScopesDirQuery(t *testing.T) {
 	fc := &fakeComfy{}
 	p, _, _, _ := newTestProxy(t, fc, nil)

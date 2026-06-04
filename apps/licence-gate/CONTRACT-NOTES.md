@@ -133,7 +133,7 @@ is never logged (the audit record carries `user`/`model`, never the token).
   gate-decision, timestamp}`. Keeps gate identity-agnostic and identity-policy
   licence-agnostic — both independently unit-testable.
 
-## /userdata scoping injects per-caller bucket AND preserves %2F encoding (v0.1.3, Plan 1b 2026-06-04)
+## /userdata scoping injects per-caller bucket; NORMALIZE %2F, never assume it survives (v0.1.3 + v0.1.4, Plan 1b 2026-06-04)
 
 ComfyUI persists workflow files via `/userdata/{file}` — `POST` to write, `GET`
 to read/list, `DELETE` to delete, `POST .../move/{dest}` to rename. Master has
@@ -147,13 +147,36 @@ directory of the userdata path: `workflows/foo.json` → `<user>/workflows/foo.j
 The move endpoint scopes BOTH file and dest (one-side scoping leaks the dest as
 an escape vector).
 
-**The Phase-1 surface bug:** Go's `httputil.NewSingleHostReverseProxy` (the
-default passthrough) decodes `%2F`→`/` when rebuilding URLs. ComfyUI's frontend
-packs multi-segment paths into the single `{file}` route param as
-`workflows%2Ffoo.json`; once decoded, master sees `/userdata/<user>/workflows/foo.json`
-(multi-segment), returns 405 because its POST route is `/userdata/{file}`
-(single segment). Fix: dedicated `forwardEncoded` that sets `RawPath` so the
-encoding survives. Asserted by `TestUserdataPreservesEncodedSlashThroughForward`.
+**The route-shape constraint:** ComfyUI's frontend packs multi-segment paths
+into the single `{file}` route param as `workflows%2Ffoo.json`. master's route is
+`/userdata/{file}` — a SINGLE segment — so the whole file path must reach master
+as ONE `%2F`-encoded segment. A multi-segment path (literal `/`) returns 405/404
+(route mismatch).
+
+**Two bugs, two versions — the lesson is the same: don't assume %2F survives.**
+
+- **v0.1.3** added the scoping but used the default `httputil.NewSingleHostReverseProxy`
+  for forward, which decodes `%2F`→`/` when rebuilding the URL. Fix: dedicated
+  `forwardEncoded` that sets `RawPath`.
+- **v0.1.4** fixed the *inbound* side. Envoy Gateway runs
+  `path_with_escaped_slashes_action=UNESCAPE_AND_REDIRECT` (its default), so a
+  browser's `POST /userdata/workflows%2FTest%20Flow.json` reaches the proxy
+  ALREADY decoded to a literal slash. v0.1.3's rewrite kept the inbound encoding
+  verbatim, so the literal slash flowed through and master 405'd on every save.
+  In-pod curl (encoded, bypasses Envoy) returned 200, masking it — only the
+  browser path hit the bug.
+
+**The robust fix (v0.1.4): operate on the FULLY DECODED logical path, re-encode
+as one segment.** `scopeSegment` `url.PathUnescape`s each part (so `%2F`-encoded
+and Envoy-decoded inputs converge to the same string), validates, prepends the
+bucket, and `url.PathEscape`s the whole `<user>/<path>` as one segment (PathEscape
+maps `/`→`%2F`). Result is byte-identical whether the inbound path arrived
+encoded or decoded — asserted by `TestRewriteUserdataURL_EnvoyDecodedMatchesEncoded`.
+A path-scoping proxy must NOT depend on `%2F` surviving HTTP intermediaries; RFC
+3986 permits them to normalize it, and Envoy does by default. We chose this over
+flipping Envoy's `escapedSlashesAction` to KeepUnchanged because that is a
+gateway-wide policy on a shared external gateway (blast radius across every app)
+and weakens a sane `%2F`-smuggling defense for one feature.
 
 **Validation rejects unsafe segments AFTER URL-decoding** (so `%2E%2E` →`..` is
 caught), and the user identifier itself is sanity-checked against URL-meaningful

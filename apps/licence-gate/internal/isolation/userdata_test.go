@@ -192,6 +192,66 @@ func TestRewriteUserdataURL_UUIDUserCommonCase(t *testing.T) {
 	}
 }
 
+// ── /api prefix (Lighthouse Plan-1b HAR 2026-06-04) ──
+// The web frontend prepends /api to every native call, so the real save path is
+// /api/userdata/... not /userdata/... . The rewrite must match the /api prefix
+// AND preserve it (master mirrors all routes under /api), or the scoping handler
+// never fires and saves fall through to passthrough → 405 + no isolation.
+
+func TestRewriteUserdataURL_ApiPrefixPreservedAndScoped(t *testing.T) {
+	in := mustURL(t, "/api/userdata/workflows%2FTest%20Realvisxl.json")
+	got, err := RewriteUserdataURL("alice", in)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := "/api/userdata/alice%2Fworkflows%2FTest%20Realvisxl.json"
+	if got.EscapedPath() != want {
+		t.Errorf("/api save: got %q, want %q", got.EscapedPath(), want)
+	}
+}
+
+func TestRewriteUserdataURL_ApiPrefixEnvoyDecoded(t *testing.T) {
+	// The exact production shape from the HAR: /api prefix AND Envoy already
+	// decoded %2F→/ (the POST that 405'd).
+	in := envoyDecoded(t,
+		"/api/userdata/workflows/Test Realvisxl.json",
+		"/api/userdata/workflows/Test%20Realvisxl.json")
+	got, err := RewriteUserdataURL("alice", in)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := "/api/userdata/alice%2Fworkflows%2FTest%20Realvisxl.json"
+	if got.EscapedPath() != want {
+		t.Errorf("/api Envoy-decoded save: got %q, want %q", got.EscapedPath(), want)
+	}
+}
+
+func TestRewriteUserdataURL_ApiPrefixListing(t *testing.T) {
+	in := mustURL(t, "/api/userdata?dir=workflows&recurse=true")
+	got, err := RewriteUserdataURL("alice", in)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got.EscapedPath() != "/api/userdata" {
+		t.Errorf("listing path changed: %q", got.EscapedPath())
+	}
+	if got.Query().Get("dir") != "alice/workflows" {
+		t.Errorf("dir not scoped: %q", got.Query().Get("dir"))
+	}
+}
+
+func TestRewriteUserdataURL_ApiPrefixMove(t *testing.T) {
+	in := mustURL(t, "/api/userdata/workflows%2Fa.json/move/workflows%2Fb.json")
+	got, err := RewriteUserdataURL("alice", in)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := "/api/userdata/alice%2Fworkflows%2Fa.json/move/alice%2Fworkflows%2Fb.json"
+	if got.EscapedPath() != want {
+		t.Errorf("/api move: got %q, want %q", got.EscapedPath(), want)
+	}
+}
+
 // ── Envoy UNESCAPE_AND_REDIRECT regression (Lighthouse Plan-1b 2026-06-04) ──
 // Envoy Gateway decodes %2F→/ before the request reaches the proxy, so the
 // inbound path carries LITERAL slashes where the frontend sent %2F. The rewrite

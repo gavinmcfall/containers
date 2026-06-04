@@ -6,9 +6,9 @@
 // reads (/view, /history, /queue) are confined to the caller's own outputs.
 //
 // Routes not listed below pass through unchanged. Per-user scoping of /ws
-// progress, /userdata, and /upload/image is a documented Phase-1 gap (the
-// heavy-tier milestone runs with a trusted admin + brand identity); they pass
-// through and are tightened in a later plan.
+// progress and /upload/image is a documented Phase-1 gap (the heavy-tier
+// milestone runs with a trusted admin + brand identity); they pass through and
+// are tightened in a later plan. /userdata is scoped here (v0.1.3+, Plan 1b).
 package proxy
 
 import (
@@ -78,6 +78,12 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		p.handleHistory(w, r)
 	case r.Method == http.MethodGet && r.URL.Path == "/queue":
 		p.handleQueue(w, r)
+	// /userdata is ComfyUI's per-file storage (workflow persistence etc). Master
+	// has no per-user concept; we inject the caller's bucket into the URL so each
+	// user gets an isolated namespace. Covers GET (list+read), POST (write),
+	// DELETE (delete), POST .../move/... (rename/move).
+	case r.URL.Path == "/userdata" || strings.HasPrefix(r.URL.Path, "/userdata/"):
+		p.handleUserdata(w, r)
 	default:
 		p.passthrough.ServeHTTP(w, r)
 	}
@@ -271,6 +277,64 @@ func (p *Proxy) filterQueueEntries(entries [][]json.RawMessage, user string) [][
 		}
 	}
 	return kept
+}
+
+// handleUserdata scopes /userdata/* to the caller's bucket. The user identifier
+// is injected as a leading directory in the userdata path, so caller A's
+// "workflows/foo.json" becomes "A/workflows/foo.json" from master's perspective;
+// caller B never sees A's files.
+//
+// Forward uses forwardEncoded — not forward — because ComfyUI's frontend packs
+// multi-segment paths into the single {file} route param via %2F encoding, and
+// the standard forward path decodes %2F→/ which makes master return 405 (route
+// mismatch).
+func (p *Proxy) handleUserdata(w http.ResponseWriter, r *http.Request) {
+	id, err := p.identify(r)
+	if err != nil {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	rewritten, err := isolation.RewriteUserdataURL(id.User, r.URL)
+	if err != nil {
+		// Unsafe path or bad encoding — fail closed.
+		http.Error(w, "userdata: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	resp, err := p.forwardEncoded(r, rewritten)
+	if err != nil {
+		http.Error(w, "upstream error", http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+	copyHeader(w.Header(), resp.Header)
+	w.WriteHeader(resp.StatusCode)
+	_, _ = io.Copy(w, resp.Body)
+}
+
+// forwardEncoded sends r to the upstream using a pre-rewritten URL whose
+// EscapedPath has been deliberately set (e.g. with %2F-encoded segment
+// separators preserved). Unlike forward, this path does NOT decode and rebuild
+// the URL via target.Path — that loses the original encoding. Mirrors forward's
+// other behavior (header copy, Origin strip).
+func (p *Proxy) forwardEncoded(r *http.Request, in *url.URL) (*http.Response, error) {
+	target := *p.cfg.Upstream
+	// Splice upstream scheme/host/base onto the rewritten path. Construct the
+	// target string manually so RawPath survives — http.NewRequest would parse
+	// our URL.String() back, which is correct, but we want to be explicit.
+	target.RawPath = in.RawPath
+	target.Path = in.Path
+	target.RawQuery = in.RawQuery
+
+	req, err := http.NewRequestWithContext(r.Context(), r.Method, target.String(), r.Body)
+	if err != nil {
+		return nil, err
+	}
+	copyHeader(req.Header, r.Header)
+	req.Header.Del("Origin") // see forward() — same DNS-rebinding 403 concern.
+	if r.ContentLength > 0 {
+		req.ContentLength = r.ContentLength
+	}
+	return p.client.Do(req)
 }
 
 // forward sends r (with an optional replacement body) to the upstream master and

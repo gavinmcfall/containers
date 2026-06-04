@@ -132,3 +132,30 @@ is never logged (the audit record carries `user`/`model`, never the token).
 - audit writer joins them + timestamp → `{user, model, licence, commercial?,
   gate-decision, timestamp}`. Keeps gate identity-agnostic and identity-policy
   licence-agnostic — both independently unit-testable.
+
+## /userdata scoping injects per-caller bucket AND preserves %2F encoding (v0.1.3, Plan 1b 2026-06-04)
+
+ComfyUI persists workflow files via `/userdata/{file}` — `POST` to write, `GET`
+to read/list, `DELETE` to delete, `POST .../move/{dest}` to rename. Master has
+**no per-user concept** — every caller writes into one shared namespace. Plan 1b
+discovered this when Gavin's "save workflow" landed in a namespace any other
+authenticated family member could overwrite, and (silently worse) reading
+another user's workflow JSON enumerates their prompts.
+
+`isolation.RewriteUserdataURL` injects the caller's identifier as the leading
+directory of the userdata path: `workflows/foo.json` → `<user>/workflows/foo.json`.
+The move endpoint scopes BOTH file and dest (one-side scoping leaks the dest as
+an escape vector).
+
+**The Phase-1 surface bug:** Go's `httputil.NewSingleHostReverseProxy` (the
+default passthrough) decodes `%2F`→`/` when rebuilding URLs. ComfyUI's frontend
+packs multi-segment paths into the single `{file}` route param as
+`workflows%2Ffoo.json`; once decoded, master sees `/userdata/<user>/workflows/foo.json`
+(multi-segment), returns 405 because its POST route is `/userdata/{file}`
+(single segment). Fix: dedicated `forwardEncoded` that sets `RawPath` so the
+encoding survives. Asserted by `TestUserdataPreservesEncodedSlashThroughForward`.
+
+**Validation rejects unsafe segments AFTER URL-decoding** (so `%2E%2E` →`..` is
+caught), and the user identifier itself is sanity-checked against URL-meaningful
+chars before being interpolated into the path. Two-callers-disjoint-buckets test
+is the canary — if it breaks, isolation is broken.

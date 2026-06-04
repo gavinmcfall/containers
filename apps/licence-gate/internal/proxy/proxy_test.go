@@ -33,6 +33,12 @@ type fakeComfy struct {
 	queueJSON           string
 	// view: filenames that "exist"; anything else → upstream 404.
 	existingViews map[string]bool
+	// userdata capture: paths (EscapedPath) and queries master saw on the
+	// /userdata routes, plus call counts. Filled by handler() below.
+	userdataCalls       int
+	lastUserdataMethod  string
+	lastUserdataRawPath string
+	lastUserdataQuery   string
 }
 
 func (f *fakeComfy) handler() http.Handler {
@@ -79,7 +85,28 @@ func (f *fakeComfy) handler() http.Handler {
 		w.Header().Set("Content-Type", "application/json")
 		io.WriteString(w, f.queueJSON)
 	})
+	// /userdata catch-all — captures what master sees so tests can assert the
+	// proxy injected the user bucket AND preserved %2F encoding through forward.
+	mux.HandleFunc("/userdata", func(w http.ResponseWriter, r *http.Request) {
+		f.captureUserdata(r)
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `["fake"]`)
+	})
+	mux.HandleFunc("/userdata/", func(w http.ResponseWriter, r *http.Request) {
+		f.captureUserdata(r)
+		w.Header().Set("Content-Type", "text/plain")
+		io.WriteString(w, "ok")
+	})
 	return mux
+}
+
+func (f *fakeComfy) captureUserdata(r *http.Request) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.userdataCalls++
+	f.lastUserdataMethod = r.Method
+	f.lastUserdataRawPath = r.URL.EscapedPath()
+	f.lastUserdataQuery = r.URL.RawQuery
 }
 
 // makeJWT builds a decode-only Pocket-ID-style id_token (bogus signature; the
@@ -514,3 +541,147 @@ func TestForwardStripsOriginHeader(t *testing.T) {
 
 // Compile-time assertion that the helper signature stays in sync.
 var _ = fmt.Sprintf
+
+// ──────────────────────────────────────────────────────────────────────────
+// /userdata scoping (Plan 1b — v0.1.3)
+// ──────────────────────────────────────────────────────────────────────────
+
+func TestUserdataMissingAuthRejected(t *testing.T) {
+	fc := &fakeComfy{}
+	p, _, _, _ := newTestProxy(t, fc, nil)
+	req := httptest.NewRequest(http.MethodGet, "/userdata/foo.json", nil)
+	// no Authorization header
+	rec := do(p, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("missing auth should 401, got %d", rec.Code)
+	}
+	if fc.userdataCalls != 0 {
+		t.Errorf("denied userdata must not reach upstream, calls=%d", fc.userdataCalls)
+	}
+}
+
+func TestUserdataSingleFileInjectsUserBucket(t *testing.T) {
+	fc := &fakeComfy{}
+	p, _, _, _ := newTestProxy(t, fc, nil)
+	req := httptest.NewRequest(http.MethodGet, "/userdata/test.json", nil)
+	req.Header.Set("Authorization", "Bearer "+makeJWT("gavin"))
+	rec := do(p, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d body=%q", rec.Code, rec.Body.String())
+	}
+	want := "/userdata/gavin%2Ftest.json"
+	if fc.lastUserdataRawPath != want {
+		t.Errorf("upstream saw EscapedPath=%q, want %q", fc.lastUserdataRawPath, want)
+	}
+}
+
+func TestUserdataPreservesEncodedSlashThroughForward(t *testing.T) {
+	// The headline bug — Phase-1 used the default reverse proxy which decoded
+	// %2F → /, master saw /userdata/<user>/workflows/foo.json (multi-segment) and
+	// returned 405 on POST (route is /userdata/{file}, single segment). The fix
+	// is forwardEncoded preserving RawPath.
+	fc := &fakeComfy{}
+	p, _, _, _ := newTestProxy(t, fc, nil)
+	req := httptest.NewRequest(http.MethodPost, "/userdata/workflows%2FTest%20Flow.json?overwrite=true",
+		strings.NewReader(`{"x":1}`))
+	req.Header.Set("Authorization", "Bearer "+makeJWT("gavin"))
+	req.Header.Set("Content-Type", "application/json")
+	rec := do(p, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d body=%q", rec.Code, rec.Body.String())
+	}
+	want := "/userdata/gavin%2Fworkflows%2FTest%20Flow.json"
+	if fc.lastUserdataRawPath != want {
+		t.Errorf("upstream saw EscapedPath=%q, want %q (encoding decoded somewhere in the chain)",
+			fc.lastUserdataRawPath, want)
+	}
+	if fc.lastUserdataQuery != "overwrite=true" {
+		t.Errorf("query not preserved: %q", fc.lastUserdataQuery)
+	}
+	if fc.lastUserdataMethod != http.MethodPost {
+		t.Errorf("method not preserved: %q", fc.lastUserdataMethod)
+	}
+}
+
+func TestUserdataListingScopesDirQuery(t *testing.T) {
+	fc := &fakeComfy{}
+	p, _, _, _ := newTestProxy(t, fc, nil)
+	req := httptest.NewRequest(http.MethodGet, "/userdata?dir=workflows", nil)
+	req.Header.Set("Authorization", "Bearer "+makeJWT("alice"))
+	rec := do(p, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d", rec.Code)
+	}
+	q, _ := url.ParseQuery(fc.lastUserdataQuery)
+	if q.Get("dir") != "alice/workflows" {
+		t.Errorf("upstream saw dir=%q, want alice/workflows", q.Get("dir"))
+	}
+}
+
+func TestUserdataListingRootDefaultsToUserBucket(t *testing.T) {
+	fc := &fakeComfy{}
+	p, _, _, _ := newTestProxy(t, fc, nil)
+	req := httptest.NewRequest(http.MethodGet, "/userdata", nil)
+	req.Header.Set("Authorization", "Bearer "+makeJWT("alice"))
+	_ = do(p, req)
+	q, _ := url.ParseQuery(fc.lastUserdataQuery)
+	if q.Get("dir") != "alice" {
+		t.Errorf("upstream saw dir=%q, want alice", q.Get("dir"))
+	}
+}
+
+func TestUserdataMoveEndpointScopesBothFileAndDest(t *testing.T) {
+	// Master's route is POST /userdata/{file}/move/{dest}. If only file got
+	// scoped, user could move their file OUT of their bucket via dest.
+	fc := &fakeComfy{}
+	p, _, _, _ := newTestProxy(t, fc, nil)
+	req := httptest.NewRequest(http.MethodPost,
+		"/userdata/workflows%2Fa.json/move/workflows%2Fb.json", nil)
+	req.Header.Set("Authorization", "Bearer "+makeJWT("gavin"))
+	rec := do(p, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unexpected status: %d", rec.Code)
+	}
+	want := "/userdata/gavin%2Fworkflows%2Fa.json/move/gavin%2Fworkflows%2Fb.json"
+	if fc.lastUserdataRawPath != want {
+		t.Errorf("upstream saw EscapedPath=%q, want %q", fc.lastUserdataRawPath, want)
+	}
+}
+
+func TestUserdataTraversalRejectedBeforeForward(t *testing.T) {
+	fc := &fakeComfy{}
+	p, _, _, _ := newTestProxy(t, fc, nil)
+	req := httptest.NewRequest(http.MethodGet, "/userdata/..%2Fetc%2Fpasswd", nil)
+	req.Header.Set("Authorization", "Bearer "+makeJWT("gavin"))
+	rec := do(p, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("traversal should 400, got %d", rec.Code)
+	}
+	if fc.userdataCalls != 0 {
+		t.Errorf("unsafe userdata must not reach upstream, calls=%d", fc.userdataCalls)
+	}
+}
+
+func TestUserdataTwoUsersGetDisjointBuckets(t *testing.T) {
+	// Same logical filename from two callers must produce different upstream
+	// paths — proves the per-user namespace is per-caller, not shared.
+	fc := &fakeComfy{}
+	p, _, _, _ := newTestProxy(t, fc, nil)
+
+	reqA := httptest.NewRequest(http.MethodGet, "/userdata/workflows%2Fshared.json", nil)
+	reqA.Header.Set("Authorization", "Bearer "+makeJWT("alice"))
+	_ = do(p, reqA)
+	pathAlice := fc.lastUserdataRawPath
+
+	reqB := httptest.NewRequest(http.MethodGet, "/userdata/workflows%2Fshared.json", nil)
+	reqB.Header.Set("Authorization", "Bearer "+makeJWT("bob"))
+	_ = do(p, reqB)
+	pathBob := fc.lastUserdataRawPath
+
+	if pathAlice == pathBob {
+		t.Errorf("two callers got the same upstream path %q — bucket isolation broken", pathAlice)
+	}
+	if !strings.Contains(pathAlice, "alice%2F") || !strings.Contains(pathBob, "bob%2F") {
+		t.Errorf("each caller's bucket should be in their path: alice=%q bob=%q", pathAlice, pathBob)
+	}
+}

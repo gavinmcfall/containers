@@ -3,6 +3,35 @@
 Build-time findings that pin the proxy contract. Keep with the code; the
 durable design lives in `gavinmcfall/lighthouse` (ADR 008, ADR 015, flow 3).
 
+## Every gated route has an `/api`-prefixed twin — match BOTH (v0.1.5, Plan-1b HAR 2026-06-04)
+
+ComfyUI's web frontend prepends `/api` to **every** native API call:
+`api.apiURL(p) => p.startsWith("/api") ? base+p : base+"/api"+p`. And master
+mirrors every route under both `/` and `/api` (`server.py`: `api_routes.route(m,
+"/api"+route.path)` for all routes). So a browser hits `/api/prompt`, `/api/view`,
+`/api/history`, `/api/queue`, `/api/userdata`; the ComfyUI-Distributed plugin
+(its own apiClient, no prefix) hits `/distributed/queue`.
+
+**This bit hard:** through v0.1.4 the proxy matched only the BARE paths. Every
+browser request therefore fell through to passthrough — **bypassing the licence
+gate (`/api/prompt`) AND per-user isolation (`/api/view`, `/api/history`,
+`/api/queue`, `/api/userdata`).** The only reason renders were still gated is that
+Lighthouse dispatches via the plugin's `/distributed/queue` (no `/api`). The
+visible symptom was the workflow-save 405 (`/api/userdata`); the silent ones were
+cross-user image/history/queue reads and an ungated native `/api/prompt`.
+
+`ServeHTTP` now normalises a leading `/api` segment for MATCHING only
+(`routePath := strings.TrimPrefix(path, "/api")` guarded to the `/api/` segment),
+then forwards the ORIGINAL `r.URL.Path` — master serves both spellings, so no
+wire rewrite is needed for prompt/view/history/queue. `RewriteUserdataURL` is
+prefix-aware (`/api/userdata` or `/userdata`) and PRESERVES the matched prefix.
+Guards: `TestPromptApiPrefixGated`, `TestViewApiPrefixScoped`,
+`TestUserdataApiPrefixScopes` + isolation `…_ApiPrefix*`.
+
+> Lesson: when fronting an app whose client uses a path prefix convention, every
+> security check must match all spellings the client/server accept. Test through
+> the real frontend path, not an in-pod curl that happens to use the bare path.
+
 ## Worker→master output data-flow (ADR 015 scope item 3) — RESOLVED 2026-05-30
 
 **Finding:** ComfyUI-Distributed collects results **on the master**. The

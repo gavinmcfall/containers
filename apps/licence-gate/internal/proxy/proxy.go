@@ -64,25 +64,44 @@ func New(cfg Config) *Proxy {
 }
 
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// ComfyUI's web frontend prepends /api to EVERY native API call
+	// (frontend api.apiURL(): `path.startsWith("/api") ? base+path : base+"/api"+path`),
+	// and master mirrors every route under both "/" and "/api" (server.py registers
+	// `"/api"+route.path` for all routes). So a browser hits /api/prompt, /api/view,
+	// /api/userdata, … while the ComfyUI-Distributed plugin (its own apiClient) hits
+	// /distributed/queue with no prefix. We MUST gate/scope both spellings — matching
+	// only the bare path let every browser request fall through to passthrough,
+	// bypassing the licence gate AND per-user output isolation (Lighthouse Plan-1b
+	// HAR 2026-06-04: /api/userdata save 405 was the visible tip; /api/view, /api/history,
+	// /api/queue were silently un-scoped too). Normalise a leading /api segment for
+	// MATCHING only; forward() preserves the original r.URL.Path, and master serves
+	// both spellings, so no prefix rewrite is needed on the wire.
+	routePath := r.URL.Path
+	if routePath == "/api" {
+		routePath = "/"
+	} else if strings.HasPrefix(routePath, "/api/") {
+		routePath = strings.TrimPrefix(routePath, "/api")
+	}
+
 	switch {
 	// Both the plain (/prompt) and the ComfyUI-Distributed GPU render path
 	// (/distributed/queue) carry the workflow graph under "prompt" and return a
 	// prompt_id — so both go through the same gate→rewrite→remember→audit
 	// pipeline. Gating only /prompt would let a render bypass the licence gate by
 	// using the distributed endpoint.
-	case r.Method == http.MethodPost && (r.URL.Path == "/prompt" || r.URL.Path == "/distributed/queue"):
+	case r.Method == http.MethodPost && (routePath == "/prompt" || routePath == "/distributed/queue"):
 		p.handlePrompt(w, r)
-	case r.Method == http.MethodGet && r.URL.Path == "/view":
+	case r.Method == http.MethodGet && routePath == "/view":
 		p.handleView(w, r)
-	case r.Method == http.MethodGet && r.URL.Path == "/history":
+	case r.Method == http.MethodGet && routePath == "/history":
 		p.handleHistory(w, r)
-	case r.Method == http.MethodGet && r.URL.Path == "/queue":
+	case r.Method == http.MethodGet && routePath == "/queue":
 		p.handleQueue(w, r)
 	// /userdata is ComfyUI's per-file storage (workflow persistence etc). Master
 	// has no per-user concept; we inject the caller's bucket into the URL so each
 	// user gets an isolated namespace. Covers GET (list+read), POST (write),
 	// DELETE (delete), POST .../move/... (rename/move).
-	case r.URL.Path == "/userdata" || strings.HasPrefix(r.URL.Path, "/userdata/"):
+	case routePath == "/userdata" || strings.HasPrefix(routePath, "/userdata/"):
 		p.handleUserdata(w, r)
 	default:
 		p.passthrough.ServeHTTP(w, r)

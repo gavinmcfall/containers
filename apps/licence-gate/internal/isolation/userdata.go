@@ -6,8 +6,23 @@ import (
 	"strings"
 )
 
-// userdataPrefix is the URL prefix for ComfyUI's userdata routes.
-const userdataPrefix = "/userdata"
+// userdataPrefixes are the URL prefixes ComfyUI serves its userdata routes
+// under. The web frontend uses /api/userdata; the bare /userdata also works on
+// master (every route is mirrored under /api). Longest first so matchUserdataPrefix
+// picks /api/userdata before /userdata. The matched prefix is preserved on the
+// rewritten URL — master serves both, and preserving avoids a needless redirect.
+var userdataPrefixes = []string{"/api/userdata", "/userdata"}
+
+// matchUserdataPrefix returns the userdata prefix that rawPath sits under (either
+// exactly, or as "<prefix>/..."), and whether one matched.
+func matchUserdataPrefix(rawPath string) (string, bool) {
+	for _, p := range userdataPrefixes {
+		if rawPath == p || strings.HasPrefix(rawPath, p+"/") {
+			return p, true
+		}
+	}
+	return "", false
+}
 
 // RewriteUserdataURL scopes a /userdata/... URL under the caller's bucket. Mirrors
 // the write-side of RewriteOutputs but for ComfyUI's userdata storage (workflow
@@ -53,17 +68,19 @@ func RewriteUserdataURL(user string, in *url.URL) (*url.URL, error) {
 	out := *in // copy; caller's URL not mutated
 	rawPath := in.EscapedPath()
 
+	prefix, ok := matchUserdataPrefix(rawPath)
+	if !ok {
+		return nil, fmt.Errorf("not a /userdata path: %q", rawPath)
+	}
+
 	switch {
-	case rawPath == userdataPrefix, rawPath == userdataPrefix+"/":
+	case rawPath == prefix, rawPath == prefix+"/":
 		// Listing endpoint — the `dir` query param is what carries the user path.
 		return rewriteListingQuery(user, &out)
 
-	case strings.HasPrefix(rawPath, userdataPrefix+"/"):
-		// File-level endpoint (read/write/delete/move).
-		return rewriteFileEndpoint(user, rawPath, &out)
-
 	default:
-		return nil, fmt.Errorf("not a /userdata path: %q", rawPath)
+		// File-level endpoint (read/write/delete/move).
+		return rewriteFileEndpoint(user, prefix, rawPath, &out)
 	}
 }
 
@@ -84,14 +101,15 @@ func rewriteListingQuery(user string, out *url.URL) (*url.URL, error) {
 	return out, nil
 }
 
-// rewriteFileEndpoint handles /userdata/{file} and /userdata/{file}/move/{dest}.
-// Works on EscapedPath to find the structural /move/ literal, then scopeSegment
-// decodes each part fully and re-encodes it as one segment — so the result is
-// correct whether the inbound file slashes arrived as %2F or as literal /.
-func rewriteFileEndpoint(user string, rawPath string, out *url.URL) (*url.URL, error) {
-	suffix := rawPath[len(userdataPrefix+"/"):] // everything after "/userdata/"
+// rewriteFileEndpoint handles <prefix>/{file} and <prefix>/{file}/move/{dest}
+// where prefix is /userdata or /api/userdata. Works on EscapedPath to find the
+// structural /move/ literal, then scopeSegment decodes each part fully and
+// re-encodes it as one segment — so the result is correct whether the inbound
+// file slashes arrived as %2F or as literal /. The matched prefix is preserved.
+func rewriteFileEndpoint(user, prefix, rawPath string, out *url.URL) (*url.URL, error) {
+	suffix := rawPath[len(prefix+"/"):] // everything after "<prefix>/"
 	if suffix == "" {
-		return nil, fmt.Errorf("empty file segment after /userdata/")
+		return nil, fmt.Errorf("empty file segment after %s/", prefix)
 	}
 
 	// Detect the move sub-route. The /move/ separator is a LITERAL in master's
@@ -109,13 +127,13 @@ func rewriteFileEndpoint(user string, rawPath string, out *url.URL) (*url.URL, e
 		if err != nil {
 			return nil, fmt.Errorf("dest segment: %w", err)
 		}
-		out.RawPath = userdataPrefix + "/" + fileSeg + "/move/" + destSeg
+		out.RawPath = prefix + "/" + fileSeg + "/move/" + destSeg
 	} else {
 		fileSeg, err := scopeSegment(user, suffix)
 		if err != nil {
 			return nil, fmt.Errorf("file segment: %w", err)
 		}
-		out.RawPath = userdataPrefix + "/" + fileSeg
+		out.RawPath = prefix + "/" + fileSeg
 	}
 
 	// Set decoded Path too. The HTTP client prefers RawPath when set; Path is the

@@ -179,8 +179,9 @@ func TestRewriteUserdataURL_RejectsNonUserdataPath(t *testing.T) {
 }
 
 func TestRewriteUserdataURL_UUIDUserCommonCase(t *testing.T) {
-	// Pocket-ID UUIDs are the common production case.
-	uuid := "4f8234ed-8cc7-4d6d-b9f7-f8447a4d5484"
+	// Pocket-ID UUIDs are the common production case. Synthetic placeholder — do
+	// NOT use a real user's sub here (this is a public repo).
+	uuid := "00000000-0000-4000-8000-000000000000"
 	in := mustURL(t, "/userdata/workflows%2Ffoo.json")
 	got, err := RewriteUserdataURL(uuid, in)
 	if err != nil {

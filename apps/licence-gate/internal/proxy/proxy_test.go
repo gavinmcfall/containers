@@ -783,3 +783,36 @@ func TestUserdataTwoUsersGetDisjointBuckets(t *testing.T) {
 		t.Errorf("each caller's bucket should be in their path: alice=%q bob=%q", pathAlice, pathBob)
 	}
 }
+
+func TestPromptRejectsMatureModelForNonMatureCaller(t *testing.T) {
+	fc := &fakeComfy{}
+	p, _, _, _ := newTestProxy(t, fc, []registry.Entry{
+		{Filename: "sd_xl_base_1.0.safetensors", CommercialOK: true, RequiresGroup: "mature-content"},
+	})
+	req := httptest.NewRequest(http.MethodPost, "/prompt",
+		bytes.NewReader(promptBody("sd_xl_base_1.0.safetensors", "render", "c1")))
+	req.Header.Set("Authorization", "Bearer "+makeJWT("gavin", "family-adult"))
+	req.Header.Set("X-Lighthouse-Personal", "true") // personal so licence passes; group must still block
+	rec := do(p, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403 (mature model, no group)", rec.Code)
+	}
+	if fc.promptCalls != 0 {
+		t.Errorf("rejected job must not reach upstream, calls=%d", fc.promptCalls)
+	}
+}
+
+func TestPromptAllowsMatureModelForMatureCaller(t *testing.T) {
+	fc := &fakeComfy{}
+	p, _, _, _ := newTestProxy(t, fc, []registry.Entry{
+		{Filename: "sd_xl_base_1.0.safetensors", CommercialOK: true, RequiresGroup: "mature-content"},
+	})
+	req := httptest.NewRequest(http.MethodPost, "/prompt",
+		bytes.NewReader(promptBody("sd_xl_base_1.0.safetensors", "render", "c1")))
+	req.Header.Set("Authorization", "Bearer "+makeJWT("gavin", "family-adult", "mature-content"))
+	req.Header.Set("X-Lighthouse-Personal", "true")
+	rec := do(p, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (caller has mature-content)", rec.Code)
+	}
+}

@@ -144,7 +144,7 @@ func (p *Proxy) handlePrompt(w http.ResponseWriter, r *http.Request) {
 	}
 
 	refs := graph.ModelReferences(p.cfg.Allowlist)
-	decision := gate.Evaluate(refs, p.cfg.Registry, gate.Job{Commercial: commercial})
+	decision := gate.Evaluate(refs, p.cfg.Registry, gate.Job{Commercial: commercial, Groups: id.Groups})
 
 	if !decision.Allowed {
 		p.audit(id, personal, commercial, rationale, refs, decision, "")

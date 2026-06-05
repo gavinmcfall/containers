@@ -211,3 +211,34 @@ and weakens a sane `%2F`-smuggling defense for one feature.
 caught), and the user identifier itself is sanity-checked against URL-meaningful
 chars before being interpolated into the path. Two-callers-disjoint-buckets test
 is the canary — if it breaks, isolation is broken.
+
+## Role-gating + tier-routing ride the model-ref loop (v0.1.6, Plan-1 2026-06-05)
+
+**Role-gating is by MODEL TAG, not workflow.** Registry entries carry
+`requires_group` (e.g. NSFW assets → `"mature-content"`). `gate.Evaluate` rejects
+(violation reason `requires-group`) unless the caller holds the group for EVERY
+referenced asset. The caller's `Groups` are passed into `gate.Job` from
+`identity` — the gate stays decode-free (it never parses a JWT; it takes resolved
+claims). Enforcing on the workflow's declared `role_allowlist` (the original
+ADR-015 phrasing) was rejected as craftable-around: a caller can hand-build a graph
+that loads the sensitive model. Gating the immutable asset is structural, like the
+licence gate (A1/A3). Coverage = every asset `ModelReferences` extracts:
+checkpoints, both LoRA loaders, IPAdapter, Hypernetwork, StyleModel, GLIGEN,
+ControlNet, **and inline `embedding:<name>` refs scanned from CLIPTextEncode text**
+(those have no loader node — a regexp scan in `ModelReferences` catches them).
+Honest boundary: this gates ACCESS to NSFW models/LoRAs, NOT prompt content (a
+general model + suggestive prompt is ungated by any model/workflow approach).
+
+**Tier-routing is proxy-side `enabled_worker_ids` filtering, no plugin patch.**
+On `POST /distributed/queue`, `applyTierFilter` intersects the envelope's
+`enabled_worker_ids` with tier-capable workers (`internal/tier`): acceptable tiers
+= intersection of each referenced model's existing `tier_fit`; a worker is kept
+only if its tier (from `gpu_config.json` `workers[].tier`, the same file the
+master reads — it ignores the extra field) is acceptable. **400 if none qualify** —
+never silently fan a job to a worker that would OOM (e.g. SDXL → 3050). Unknown/
+untagged models don't constrain (licence gate owns unknown-model policy).
+
+**Ship-inert/activate-via-config:** v0.1.6 is backward-compatible — untagged model
+= no role restriction; nil `WorkerTiers` (no `tier` field, or no gpu_config mount)
+= no tier filtering. The image is a no-op until the registry/gpu_config are tagged,
+so deploy risk is decoupled from policy activation.

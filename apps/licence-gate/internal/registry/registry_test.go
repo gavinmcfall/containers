@@ -41,3 +41,21 @@ func TestResolveUnknownModelNotFound(t *testing.T) {
 		t.Fatal("unknown model should not resolve")
 	}
 }
+
+func TestEntryCarriesRequiresGroup(t *testing.T) {
+	reg, err := Load([]byte(`[
+	  {"filename":"nsfw.safetensors","commercial_ok":false,"requires_group":"mature-content"},
+	  {"filename":"open.safetensors","commercial_ok":true}
+	]`))
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	e, ok := reg.Resolve("nsfw.safetensors")
+	if !ok || e.RequiresGroup != "mature-content" {
+		t.Fatalf("nsfw RequiresGroup = %q ok=%v, want mature-content/true", e.RequiresGroup, ok)
+	}
+	o, _ := reg.Resolve("open.safetensors")
+	if o.RequiresGroup != "" {
+		t.Errorf("untagged RequiresGroup = %q, want empty", o.RequiresGroup)
+	}
+}

@@ -18,6 +18,10 @@ type Entry struct {
 	CommercialOK bool     `json:"commercial_ok"`
 	TierFit      []string `json:"tier_fit,omitempty"`
 	Substitutes  []string `json:"substitutes,omitempty"`
+	// RequiresGroup is the Pocket-ID group a caller must hold to use this asset
+	// ("" = open to all family). Role-gating rides the model tag, not the
+	// workflow (ADR 015): uncraftable-around. See plan 2026-06-05-role-tier-gating.
+	RequiresGroup string `json:"requires_group,omitempty"`
 }
 
 // Registry resolves a model filename to its licence entry.

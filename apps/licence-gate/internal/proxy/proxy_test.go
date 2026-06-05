@@ -16,6 +16,7 @@ import (
 	"github.com/gavinmcfall/containers/apps/licence-gate/internal/audit"
 	"github.com/gavinmcfall/containers/apps/licence-gate/internal/isolation"
 	"github.com/gavinmcfall/containers/apps/licence-gate/internal/registry"
+	"github.com/gavinmcfall/containers/apps/licence-gate/internal/tier"
 	"github.com/gavinmcfall/containers/apps/licence-gate/internal/workflow"
 )
 
@@ -155,6 +156,10 @@ func promptBody(ckpt, prefix, clientID string) []byte {
 
 // newTestProxy wires a proxy in front of fc with the given registry entries.
 func newTestProxy(t *testing.T, fc *fakeComfy, entries []registry.Entry) (*Proxy, *fakeComfy, *bytes.Buffer, *isolation.PromptOwners) {
+	return newTestProxyWithTiers(t, fc, entries, nil)
+}
+
+func newTestProxyWithTiers(t *testing.T, fc *fakeComfy, entries []registry.Entry, tiers tier.Map) (*Proxy, *fakeComfy, *bytes.Buffer, *isolation.PromptOwners) {
 	t.Helper()
 	upstream := httptest.NewServer(fc.handler())
 	t.Cleanup(upstream.Close)
@@ -175,8 +180,9 @@ func newTestProxy(t *testing.T, fc *fakeComfy, entries []registry.Entry) (*Proxy
 		Registry:   reg,
 		BrandToken: "brand-secret",
 		Audit:      audit.NewWriter(auditBuf),
-		Owners:     owners,
-		Now:        func() string { return "2026-06-01T00:00:00Z" },
+		Owners:      owners,
+		Now:         func() string { return "2026-06-01T00:00:00Z" },
+		WorkerTiers: tiers,
 	})
 	return p, fc, auditBuf, owners
 }
@@ -781,5 +787,96 @@ func TestUserdataTwoUsersGetDisjointBuckets(t *testing.T) {
 	}
 	if !strings.Contains(pathAlice, "alice%2F") || !strings.Contains(pathBob, "bob%2F") {
 		t.Errorf("each caller's bucket should be in their path: alice=%q bob=%q", pathAlice, pathBob)
+	}
+}
+
+func TestPromptRejectsMatureModelForNonMatureCaller(t *testing.T) {
+	fc := &fakeComfy{}
+	p, _, _, _ := newTestProxy(t, fc, []registry.Entry{
+		{Filename: "sd_xl_base_1.0.safetensors", CommercialOK: true, RequiresGroup: "mature-content"},
+	})
+	req := httptest.NewRequest(http.MethodPost, "/prompt",
+		bytes.NewReader(promptBody("sd_xl_base_1.0.safetensors", "render", "c1")))
+	req.Header.Set("Authorization", "Bearer "+makeJWT("gavin", "family-adult"))
+	req.Header.Set("X-Lighthouse-Personal", "true") // personal so licence passes; group must still block
+	rec := do(p, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403 (mature model, no group)", rec.Code)
+	}
+	if fc.promptCalls != 0 {
+		t.Errorf("rejected job must not reach upstream, calls=%d", fc.promptCalls)
+	}
+}
+
+func TestPromptAllowsMatureModelForMatureCaller(t *testing.T) {
+	fc := &fakeComfy{}
+	p, _, _, _ := newTestProxy(t, fc, []registry.Entry{
+		{Filename: "sd_xl_base_1.0.safetensors", CommercialOK: true, RequiresGroup: "mature-content"},
+	})
+	req := httptest.NewRequest(http.MethodPost, "/prompt",
+		bytes.NewReader(promptBody("sd_xl_base_1.0.safetensors", "render", "c1")))
+	req.Header.Set("Authorization", "Bearer "+makeJWT("gavin", "family-adult", "mature-content"))
+	req.Header.Set("X-Lighthouse-Personal", "true")
+	rec := do(p, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (caller has mature-content)", rec.Code)
+	}
+}
+
+// distributedBodyWorkers builds a /distributed/queue envelope with a specific
+// enabled_worker_ids list (overriding the default in distributedBody).
+func distributedBodyWorkers(ckpt, prefix, clientID string, workerIDs []string) []byte {
+	var env map[string]any
+	_ = json.Unmarshal(distributedBody(ckpt, prefix, clientID), &env)
+	env["enabled_worker_ids"] = workerIDs
+	b, _ := json.Marshal(env)
+	return b
+}
+
+// lastDistributedWorkerIDs reads enabled_worker_ids from the last captured envelope.
+func (f *fakeComfy) lastDistributedWorkerIDs() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var env struct {
+		IDs []string `json:"enabled_worker_ids"`
+	}
+	_ = json.Unmarshal(f.lastDistributedBody, &env)
+	return env.IDs
+}
+
+func TestDistributedQueueDropsIncapableWorker(t *testing.T) {
+	fc := &fakeComfy{}
+	p, _, _, _ := newTestProxyWithTiers(t, fc,
+		[]registry.Entry{{Filename: "sd_xl_base_1.0.safetensors", CommercialOK: true, TierFit: []string{"heavy"}}},
+		tier.Map{"venge": "heavy", "nova": "light"})
+	env := distributedBodyWorkers("sd_xl_base_1.0.safetensors", "render", "c1", []string{"venge", "nova"})
+	req := httptest.NewRequest(http.MethodPost, "/distributed/queue", bytes.NewReader(env))
+	req.Header.Set("Authorization", "Bearer "+makeJWT("gavin", "family-adult"))
+	req.Header.Set("X-Lighthouse-Personal", "true")
+	rec := do(p, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%q", rec.Code, rec.Body.String())
+	}
+	ids := fc.lastDistributedWorkerIDs()
+	if len(ids) != 1 || ids[0] != "venge" {
+		t.Errorf("upstream enabled_worker_ids = %v, want [venge] (nova dropped)", ids)
+	}
+}
+
+func TestDistributedQueueRejectsWhenNoCapableWorker(t *testing.T) {
+	fc := &fakeComfy{}
+	p, _, _, _ := newTestProxyWithTiers(t, fc,
+		[]registry.Entry{{Filename: "sd_xl_base_1.0.safetensors", CommercialOK: true, TierFit: []string{"heavy"}}},
+		tier.Map{"nova": "light"})
+	env := distributedBodyWorkers("sd_xl_base_1.0.safetensors", "render", "c1", []string{"nova"})
+	req := httptest.NewRequest(http.MethodPost, "/distributed/queue", bytes.NewReader(env))
+	req.Header.Set("Authorization", "Bearer "+makeJWT("gavin", "family-adult"))
+	req.Header.Set("X-Lighthouse-Personal", "true")
+	rec := do(p, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d, want 400 (no capable worker)", rec.Code)
+	}
+	if fc.distributedCalls != 0 {
+		t.Errorf("must not reach upstream, calls=%d", fc.distributedCalls)
 	}
 }

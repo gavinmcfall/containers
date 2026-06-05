@@ -19,6 +19,7 @@ const (
 const (
 	ReasonNonCommercial = "non-commercial"
 	ReasonUnknown       = "unknown"
+	ReasonRequiresGroup = "requires-group"
 )
 
 // Job carries the resolved licence intent for a submission. Commercial is the
@@ -26,6 +27,9 @@ const (
 // applied upstream when reading identity).
 type Job struct {
 	Commercial bool
+	// Groups are the caller's Pocket-ID group claims, resolved upstream and
+	// passed in — the gate stays decode-free (identity package owns JWT parsing).
+	Groups []string
 }
 
 // Violation is one model that fails the policy.
@@ -65,10 +69,28 @@ func Evaluate(refs []workflow.ModelRef, reg *registry.Registry, job Job) Decisio
 				Substitutes: entry.Substitutes,
 			})
 		}
+		// Role-gating rides the model tag (ADR 015): a tagged asset requires the
+		// caller to hold its group, independent of the licence axis above.
+		if known && entry.RequiresGroup != "" && !hasGroup(job.Groups, entry.RequiresGroup) {
+			violations = append(violations, Violation{
+				Filename: ref.Filename,
+				Reason:   ReasonRequiresGroup,
+			})
+		}
 	}
 
 	if len(violations) > 0 {
 		return Decision{Allowed: false, Action: ActionReject, Violations: violations}
 	}
 	return Decision{Allowed: true, Action: ActionAllow}
+}
+
+// hasGroup reports whether the caller holds the named group.
+func hasGroup(groups []string, want string) bool {
+	for _, g := range groups {
+		if g == want {
+			return true
+		}
+	}
+	return false
 }

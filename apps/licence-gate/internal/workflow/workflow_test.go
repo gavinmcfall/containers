@@ -102,3 +102,20 @@ func TestModelReferencesCoversOutcomeModifiers(t *testing.T) {
 		}
 	}
 }
+
+func TestModelReferencesExtractsEmbeddings(t *testing.T) {
+	body := []byte(`{"prompt":{
+	  "1":{"class_type":"CLIPTextEncode","inputs":{"text":"a photo, embedding:nsfw_ti, masterpiece embedding:another"}},
+	  "2":{"class_type":"CLIPTextEncode","inputs":{"text":"no embeds here"}}
+	}}`)
+	g, _ := Parse(body)
+	got := map[string]string{}
+	for _, r := range g.ModelReferences(DefaultAllowlist) {
+		got[r.Filename] = r.Folder
+	}
+	for _, name := range []string{"nsfw_ti", "another"} {
+		if got[name] != "embeddings" {
+			t.Errorf("embedding %q folder=%q, want embeddings (not extracted?)", name, got[name])
+		}
+	}
+}

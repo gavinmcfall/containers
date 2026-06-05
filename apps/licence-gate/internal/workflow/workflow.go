@@ -14,8 +14,13 @@ package workflow
 import (
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"sort"
 )
+
+// embeddingRef matches ComfyUI inline textual-inversion references in prompt
+// text: "embedding:name" or "embedding:name.safetensors" (extension optional).
+var embeddingRef = regexp.MustCompile(`embedding:([A-Za-z0-9_./\-]+)`)
 
 // Node is a single ComfyUI graph node.
 type Node struct {
@@ -161,6 +166,25 @@ func (g *Graph) ModelReferences(allow Allowlist) []ModelRef {
 				Field:     mf.Field,
 				Filename:  v,
 				Folder:    mf.Folder,
+			})
+		}
+	}
+	// Inline textual-inversion embeddings live in CLIPTextEncode text, not a
+	// loader field — scan them so they role-gate like any other asset
+	// (plan 2026-06-05-role-tier-gating).
+	for _, id := range g.sortedIDs() {
+		node := g.Nodes[id]
+		if node.ClassType != "CLIPTextEncode" {
+			continue
+		}
+		text, _ := node.Inputs["text"].(string)
+		for _, m := range embeddingRef.FindAllStringSubmatch(text, -1) {
+			refs = append(refs, ModelRef{
+				NodeID:    id,
+				ClassType: node.ClassType,
+				Field:     "text",
+				Filename:  m[1],
+				Folder:    "embeddings",
 			})
 		}
 	}

@@ -11,6 +11,7 @@
 //	LIGHTHOUSE_ALLOWLIST_PATH  node allowlist JSON      (default /etc/lighthouse/allowlist.json) — optional, falls back to built-in
 //	LIGHTHOUSE_DR_TOKEN        brand service-account bearer (from Secret; optional)
 //	LIGHTHOUSE_OWNERS_CAP      prompt-owner LRU capacity (default 4096)
+//	LIGHTHOUSE_GPU_CONFIG_PATH gpu_config.json for worker tiers (default /config/gpu_config.json) — optional, enables tier-aware dispatch
 package main
 
 import (
@@ -28,6 +29,7 @@ import (
 	"github.com/gavinmcfall/containers/apps/licence-gate/internal/isolation"
 	"github.com/gavinmcfall/containers/apps/licence-gate/internal/proxy"
 	"github.com/gavinmcfall/containers/apps/licence-gate/internal/registry"
+	"github.com/gavinmcfall/containers/apps/licence-gate/internal/tier"
 	"github.com/gavinmcfall/containers/apps/licence-gate/internal/workflow"
 )
 
@@ -59,18 +61,32 @@ func run() error {
 		}
 	}
 
+	// Worker→tier map for tier-aware dispatch (optional). Read from the same
+	// gpu_config.json the master uses (workers[].tier; master ignores the field).
+	// Absent/unparseable → nil → tier filtering disabled (fan-out unchanged).
+	var workerTiers tier.Map
+	gpuConfigPath := envOr("LIGHTHOUSE_GPU_CONFIG_PATH", "/config/gpu_config.json")
+	if data, err := os.ReadFile(gpuConfigPath); err == nil {
+		if wt, err := tier.LoadFromGPUConfig(data); err == nil {
+			workerTiers = wt
+		} else {
+			log.Printf("gpu_config tier parse failed (tier filtering disabled): %v", err)
+		}
+	}
+
 	p := proxy.New(proxy.Config{
-		Upstream:   upstream,
-		Allowlist:  allow,
-		Registry:   reg,
-		BrandToken: os.Getenv("LIGHTHOUSE_DR_TOKEN"),
-		Audit:      audit.NewWriter(os.Stdout),
-		Owners:     isolation.NewPromptOwners(cap),
-		Now:        func() string { return time.Now().UTC().Format(time.RFC3339) },
+		Upstream:    upstream,
+		Allowlist:   allow,
+		Registry:    reg,
+		BrandToken:  os.Getenv("LIGHTHOUSE_DR_TOKEN"),
+		Audit:       audit.NewWriter(os.Stdout),
+		Owners:      isolation.NewPromptOwners(cap),
+		Now:         func() string { return time.Now().UTC().Format(time.RFC3339) },
+		WorkerTiers: workerTiers,
 	})
 
-	log.Printf("licence-gate listening on %s → upstream %s (registry %s, %d allowlisted nodes)",
-		listen, upstream, regPath, len(allow))
+	log.Printf("licence-gate listening on %s → upstream %s (registry %s, %d allowlisted nodes, %d worker tiers)",
+		listen, upstream, regPath, len(allow), len(workerTiers))
 	return http.ListenAndServe(listen, p)
 }
 

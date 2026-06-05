@@ -26,6 +26,7 @@ import (
 	"github.com/gavinmcfall/containers/apps/licence-gate/internal/identity"
 	"github.com/gavinmcfall/containers/apps/licence-gate/internal/isolation"
 	"github.com/gavinmcfall/containers/apps/licence-gate/internal/registry"
+	"github.com/gavinmcfall/containers/apps/licence-gate/internal/tier"
 	"github.com/gavinmcfall/containers/apps/licence-gate/internal/workflow"
 )
 
@@ -45,6 +46,9 @@ type Config struct {
 	Audit      *audit.Writer      // §6 audit sink (stdout JSON in prod)
 	Owners     *isolation.PromptOwners
 	Now        func() string // RFC3339 timestamp source (injectable for tests)
+	// WorkerTiers maps worker_id -> VRAM tier; nil disables tier filtering (the
+	// /distributed/queue enabled_worker_ids pass through untouched).
+	WorkerTiers tier.Map
 }
 
 // Proxy is the licence-gate HTTP handler.
@@ -167,6 +171,17 @@ func (p *Proxy) handlePrompt(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		http.Error(w, "re-encode prompt", http.StatusInternalServerError)
 		return
+	}
+
+	// On the distributed render path, drop workers that can't run this job's
+	// models from enabled_worker_ids (e.g. a 3050 handed SDXL). Reject if none
+	// qualify — never silently fan out to a worker that would OOM.
+	if p.cfg.WorkerTiers != nil && strings.HasSuffix(r.URL.Path, "/distributed/queue") {
+		rewritten, err = p.applyTierFilter(rewritten, refs)
+		if err != nil {
+			http.Error(w, "tier: "+err.Error(), http.StatusBadRequest)
+			return
+		}
 	}
 
 	resp, err := p.forward(r, rewritten)
@@ -418,6 +433,35 @@ func (p *Proxy) audit(id identity.Identity, personal, commercial bool, rationale
 		Decision:              d.Action,
 		PromptID:              promptID,
 	})
+}
+
+// applyTierFilter intersects the distributed envelope's enabled_worker_ids with
+// tier-capable workers and writes the filtered list back. Returns an error (→400)
+// if the job has a tier constraint no enabled worker satisfies. Envelopes with no
+// enabled_worker_ids (master-local) pass through unchanged.
+func (p *Proxy) applyTierFilter(body []byte, refs []workflow.ModelRef) ([]byte, error) {
+	var env map[string]json.RawMessage
+	if err := json.Unmarshal(body, &env); err != nil {
+		return nil, fmt.Errorf("envelope parse: %w", err)
+	}
+	raw, ok := env["enabled_worker_ids"]
+	if !ok {
+		return body, nil
+	}
+	var requested []string
+	if err := json.Unmarshal(raw, &requested); err != nil {
+		return nil, fmt.Errorf("enabled_worker_ids parse: %w", err)
+	}
+	kept, err := tier.Filter(refs, p.cfg.Registry, p.cfg.WorkerTiers, requested)
+	if err != nil {
+		return nil, err
+	}
+	keptRaw, err := json.Marshal(kept)
+	if err != nil {
+		return nil, fmt.Errorf("re-encode worker ids: %w", err)
+	}
+	env["enabled_worker_ids"] = keptRaw
+	return json.Marshal(env)
 }
 
 // reencodePrompt writes the rewritten graph back into the original ComfyUI

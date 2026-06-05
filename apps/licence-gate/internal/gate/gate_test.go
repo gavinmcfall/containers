@@ -82,3 +82,27 @@ func TestPersonalJobMayUseNonCommercialModel(t *testing.T) {
 		t.Fatalf("personal job should be allowed to use a non-commercial model: %+v", d)
 	}
 }
+
+func TestEvaluateRejectsMissingGroup(t *testing.T) {
+	reg, _ := registry.Load([]byte(`[
+	  {"filename":"nsfw.safetensors","commercial_ok":true,"requires_group":"mature-content"}
+	]`))
+	refs := []workflow.ModelRef{{Filename: "nsfw.safetensors"}}
+
+	// caller WITHOUT the group, personal job (licence fine) -> reject on group
+	d := Evaluate(refs, reg, Job{Commercial: false, Groups: []string{"family-minor"}})
+	if d.Allowed || len(d.Violations) != 1 || d.Violations[0].Reason != ReasonRequiresGroup {
+		t.Fatalf("missing-group: %+v, want reject requires-group", d)
+	}
+	// caller WITH the group -> allow
+	d2 := Evaluate(refs, reg, Job{Commercial: false, Groups: []string{"mature-content"}})
+	if !d2.Allowed {
+		t.Fatalf("with-group should allow: %+v", d2)
+	}
+	// untagged model -> allow regardless of groups
+	reg2, _ := registry.Load([]byte(`[{"filename":"open.safetensors","commercial_ok":true}]`))
+	d3 := Evaluate([]workflow.ModelRef{{Filename: "open.safetensors"}}, reg2, Job{Commercial: false, Groups: nil})
+	if !d3.Allowed {
+		t.Fatalf("untagged should allow: %+v", d3)
+	}
+}

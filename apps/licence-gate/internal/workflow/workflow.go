@@ -69,6 +69,13 @@ var DefaultAllowlist = Allowlist{
 	"CLIPLoader":             {ModelFields: []ModelField{{"clip_name", "text_encoders"}}},
 	"DualCLIPLoader":         {ModelFields: []ModelField{{"clip_name1", "text_encoders"}, {"clip_name2", "text_encoders"}}},
 	"ControlNetLoader":       {ModelFields: []ModelField{{"control_net_name", "controlnet"}}},
+	// Outcome-modifier loaders — role-gating must see every asset that steers the
+	// render, not just the checkpoint (plan 2026-06-05-role-tier-gating).
+	"LoraLoaderModelOnly":  {ModelFields: []ModelField{{"lora_name", "loras"}}},
+	"IPAdapterModelLoader": {ModelFields: []ModelField{{"ipadapter_file", "ipadapter"}}},
+	"HypernetworkLoader":   {ModelFields: []ModelField{{"hypernetwork_name", "hypernetworks"}}},
+	"StyleModelLoader":     {ModelFields: []ModelField{{"style_model_name", "style_models"}}},
+	"GLIGENLoader":         {ModelFields: []ModelField{{"gligen_name", "gligen"}}},
 	// Output savers (image; the only Phase-1 savers — audio/video/model-writers
 	// are intentionally absent so they're rejected by default-deny).
 	"SaveImage":        {OutputField: "filename_prefix"},

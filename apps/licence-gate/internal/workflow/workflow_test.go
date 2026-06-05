@@ -79,3 +79,26 @@ func TestValidateAllowsStandardWorkshopGraph(t *testing.T) {
 		t.Fatalf("standard workshop graph should validate: %v", err)
 	}
 }
+
+func TestModelReferencesCoversOutcomeModifiers(t *testing.T) {
+	body := []byte(`{"prompt":{
+	  "1":{"class_type":"LoraLoaderModelOnly","inputs":{"lora_name":"nsfw_lora.safetensors"}},
+	  "2":{"class_type":"IPAdapterModelLoader","inputs":{"ipadapter_file":"ip.safetensors"}},
+	  "3":{"class_type":"HypernetworkLoader","inputs":{"hypernetwork_name":"h.pt"}},
+	  "4":{"class_type":"StyleModelLoader","inputs":{"style_model_name":"s.safetensors"}},
+	  "5":{"class_type":"GLIGENLoader","inputs":{"gligen_name":"g.safetensors"}}
+	}}`)
+	g, err := Parse(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]bool{}
+	for _, r := range g.ModelReferences(DefaultAllowlist) {
+		got[r.Filename] = true
+	}
+	for _, want := range []string{"nsfw_lora.safetensors", "ip.safetensors", "h.pt", "s.safetensors", "g.safetensors"} {
+		if !got[want] {
+			t.Errorf("ref %q not extracted (loader not allowlisted)", want)
+		}
+	}
+}

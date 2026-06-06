@@ -111,6 +111,15 @@ RUN set -eux; \
     for d in custom_nodes/ComfyUI-Impact-Pack custom_nodes/ComfyUI-Impact-Subpack custom_nodes/comfyui_controlnet_aux; do \
         if [ -f "$d/requirements.txt" ]; then pip install -r "$d/requirements.txt"; fi; \
     done; \
+    # ultralytics + comfyui_controlnet_aux pull opencv-python (the GUI build), whose cv2
+    # needs libGL/libxcb system libs absent from this slim base — so Impact-Pack and
+    # controlnet_aux fail `import cv2` and don't register. This master is headless and
+    # only needs the nodes importable to VALIDATE graphs; normalise to the headless cv2
+    # build (identical API, no GUI/GL libs). Done last so no transitive dep reasserts the
+    # GUI build. The import gate below fails the build loudly if cv2 ever can't load again.
+    pip uninstall -y opencv-python opencv-contrib-python 2>/dev/null || true; \
+    pip install --force-reinstall --no-cache-dir opencv-python-headless; \
+    python -c "import cv2; print('cv2 headless OK', cv2.__version__)"; \
     # Build-time gate: USDU submodule must be physically present, else it egresses on import.
     test -f custom_nodes/ComfyUI_UltimateSDUpscale/repositories/ultimate_sd_upscale/scripts/ultimate-upscale.py; \
     find custom_nodes -type d -name .git -prune -exec rm -rf {} +

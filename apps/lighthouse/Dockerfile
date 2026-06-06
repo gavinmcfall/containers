@@ -14,6 +14,12 @@ FROM docker.io/library/python:3.12-slim-bookworm
 ARG VENDOR
 ARG VERSION
 ARG DISTRIBUTED_REF
+# Phase-2a curated node packs — pinned by commit SHA (vetted 2026-06-06).
+ARG IMPACT_PACK_REF
+ARG IMPACT_SUBPACK_REF
+ARG USDU_REF
+ARG CONTROLNET_AUX_REF
+ARG IPADAPTER_REF
 
 ENV \
     PIP_BREAK_SYSTEM_PACKAGES=1 \
@@ -71,6 +77,42 @@ RUN set -eux; \
     for d in custom_nodes/*/; do \
         if [ -f "$d/requirements.txt" ]; then pip install -r "$d/requirements.txt"; fi; \
     done; \
+    find custom_nodes -type d -name .git -prune -exec rm -rf {} +
+
+# Phase-2a curated node packs — pinned by commit SHA, vetted 2026-06-06 (security
+# reports in lighthouse IMPL-STATUS). The licence-gate §7 allowlist (default-deny)
+# admits only the specific vetted class_types; everything else these packs register
+# stays denied. Model auto-download is suppressed (skip_download_model sentinel +
+# HF_HUB_OFFLINE at runtime); all weights are pre-staged on the worker model dirs.
+# This master is orchestrator-only (--cpu) and needs the nodes present so it can
+# VALIDATE graphs; the actual render runs on the GPU workers (symmetric install).
+RUN set -eux; \
+    # Impact-Pack + Subpack — FaceDetailer / SAMLoader / UltralyticsDetectorProvider.
+    git clone https://github.com/ltdrdata/ComfyUI-Impact-Pack custom_nodes/ComfyUI-Impact-Pack; \
+    git -C custom_nodes/ComfyUI-Impact-Pack checkout "${IMPACT_PACK_REF}"; \
+    git clone https://github.com/ltdrdata/ComfyUI-Impact-Subpack custom_nodes/ComfyUI-Impact-Subpack; \
+    git -C custom_nodes/ComfyUI-Impact-Subpack checkout "${IMPACT_SUBPACK_REF}"; \
+    # Drop the unpinned `git+…/sam2` dep (SAM2 unneeded for vit_b; supply-chain risk).
+    sed -i '/sam2/d' custom_nodes/ComfyUI-Impact-Pack/requirements.txt; \
+    # Suppress install-time + first-run model auto-download (weights pre-staged).
+    touch custom_nodes/skip_download_model; \
+    # Ultimate SD Upscale — the vendored A1111 USDU script is a git submodule; init it
+    # so the `__init__.py` runtime master.zip fallback never fires (egress-safe).
+    git clone https://github.com/ssitu/ComfyUI_UltimateSDUpscale custom_nodes/ComfyUI_UltimateSDUpscale; \
+    git -C custom_nodes/ComfyUI_UltimateSDUpscale checkout "${USDU_REF}"; \
+    git -C custom_nodes/ComfyUI_UltimateSDUpscale submodule update --init --recursive; \
+    # ControlNet aux preprocessors — only Canny + DepthAnythingV2 get allowlisted.
+    git clone https://github.com/Fannovel16/comfyui_controlnet_aux custom_nodes/comfyui_controlnet_aux; \
+    git -C custom_nodes/comfyui_controlnet_aux checkout "${CONTROLNET_AUX_REF}"; \
+    # IPAdapter plus — no insightface; FaceID nodes left un-allowlisted.
+    git clone https://github.com/cubiq/ComfyUI_IPAdapter_plus custom_nodes/ComfyUI_IPAdapter_plus; \
+    git -C custom_nodes/ComfyUI_IPAdapter_plus checkout "${IPADAPTER_REF}"; \
+    # Install each pack's runtime deps (sam2 line stripped; USDU + IPAdapter declare none).
+    for d in custom_nodes/ComfyUI-Impact-Pack custom_nodes/ComfyUI-Impact-Subpack custom_nodes/comfyui_controlnet_aux; do \
+        if [ -f "$d/requirements.txt" ]; then pip install -r "$d/requirements.txt"; fi; \
+    done; \
+    # Build-time gate: USDU submodule must be physically present, else it egresses on import.
+    test -f custom_nodes/ComfyUI_UltimateSDUpscale/repositories/ultimate_sd_upscale/scripts/ultimate-upscale.py; \
     find custom_nodes -type d -name .git -prune -exec rm -rf {} +
 
 # A passwd/group entry for the non-root UID — torch's getpass.getuser() (inductor

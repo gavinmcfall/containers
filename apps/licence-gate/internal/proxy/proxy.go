@@ -28,6 +28,7 @@ import (
 	"time"
 
 	"github.com/gavinmcfall/containers/apps/licence-gate/internal/audit"
+	"github.com/gavinmcfall/containers/apps/licence-gate/internal/curation"
 	"github.com/gavinmcfall/containers/apps/licence-gate/internal/gate"
 	"github.com/gavinmcfall/containers/apps/licence-gate/internal/identity"
 	"github.com/gavinmcfall/containers/apps/licence-gate/internal/isolation"
@@ -61,6 +62,10 @@ type Config struct {
 	// wipe ComfyUI's in-memory job history); empty disables it (completed jobs fall
 	// back to the live master list).
 	OutputDir string
+	// Curation is the role-scoped set of vetted workflows overlaid onto every
+	// caller's App Mode (served from this set, not any user's bucket). Nil/empty
+	// disables curation (userdata behaves as plain per-user isolation).
+	Curation *curation.Set
 }
 
 // Proxy is the licence-gate HTTP handler.
@@ -556,6 +561,29 @@ func (p *Proxy) handleUserdata(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
+
+	// Logical (prefix/encoding-agnostic) view of the request, used to decide
+	// whether it targets the curated namespace or the caller's own bucket.
+	req, _ := isolation.ParseUserdataRequest(r.URL)
+
+	// Curated namespace: a small GitOps-managed set of vetted workflows overlaid
+	// onto every caller's App Mode, role-scoped (app-mode-curation design #10).
+	// They live in NO user's bucket — the proxy serves them directly on read and
+	// refuses writes (the curated set is read-only to the family). Lookup is role-
+	// filtered, so a path the caller can't see falls through to their own bucket.
+	if !p.cfg.Curation.Empty() && !req.Listing && req.File != "" {
+		if entry, ok := p.cfg.Curation.Lookup(req.File, id); ok {
+			if r.Method == http.MethodGet {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write(entry.Content)
+				return
+			}
+			http.Error(w, "curated workflow is read-only", http.StatusForbidden)
+			return
+		}
+	}
+
 	rewritten, err := isolation.RewriteUserdataURL(id.User, r.URL)
 	if err != nil {
 		// Unsafe path or bad encoding — fail closed.
@@ -568,9 +596,74 @@ func (p *Proxy) handleUserdata(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer resp.Body.Close()
+
+	// Listing of a directory that contains curated entries → merge them
+	// (role-filtered) into master's response so the family sees the curated set
+	// alongside their own workflows. Also synthesizes a 200 when master 404s a
+	// fresh user's not-yet-created bucket dir.
+	if r.Method == http.MethodGet && req.Listing && !p.cfg.Curation.Empty() {
+		recurse := strings.EqualFold(r.URL.Query().Get("recurse"), "true")
+		curated := p.cfg.Curation.ListUnder(req.Dir, recurse, id)
+		if len(curated) > 0 {
+			fullInfo := strings.EqualFold(r.URL.Query().Get("full_info"), "true")
+			split := strings.EqualFold(r.URL.Query().Get("split"), "true")
+			if body, ok := mergeCuratedListing(resp, curated, fullInfo, split); ok {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write(body)
+				return
+			}
+		}
+	}
+
 	copyHeader(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
 	_, _ = io.Copy(w, resp.Body)
+}
+
+// mergeCuratedListing appends role-filtered curated entries to master's userdata
+// listing, producing the shape the request asked for (full_info objects, plain
+// strings, or split arrays — ComfyUI's three listing forms). A 200 master body is
+// parsed and extended; a 404 (fresh user whose bucket dir doesn't exist yet)
+// becomes a 200 of just the curated entries. Any other status, or an unparseable
+// 200 body, returns ok=false so the caller passes the original response through.
+func mergeCuratedListing(resp *http.Response, curated []curation.Listed, fullInfo, split bool) ([]byte, bool) {
+	var arr []json.RawMessage
+	switch resp.StatusCode {
+	case http.StatusOK:
+		raw, _ := io.ReadAll(resp.Body)
+		if err := json.Unmarshal(raw, &arr); err != nil {
+			return nil, false // not the array shape we expected — don't disturb it
+		}
+	case http.StatusNotFound:
+		arr = []json.RawMessage{}
+	default:
+		return nil, false
+	}
+	for _, c := range curated {
+		if enc, err := encodeListed(c, fullInfo, split); err == nil {
+			arr = append(arr, enc)
+		}
+	}
+	out, err := json.Marshal(arr)
+	if err != nil {
+		return nil, false
+	}
+	return out, true
+}
+
+// encodeListed renders one curated listing entry in ComfyUI's listing shape for
+// the requested params: full_info → {path,size,modified}; split → [rel, parts…];
+// else → the bare relative path string.
+func encodeListed(c curation.Listed, fullInfo, split bool) (json.RawMessage, error) {
+	switch {
+	case fullInfo:
+		return json.Marshal(map[string]any{"path": c.RelPath, "size": c.Size, "modified": c.ModifiedMS})
+	case split:
+		return json.Marshal(append([]string{c.RelPath}, strings.Split(c.RelPath, "/")...))
+	default:
+		return json.Marshal(c.RelPath)
+	}
 }
 
 // forwardEncoded sends r to the upstream using a pre-rewritten URL whose

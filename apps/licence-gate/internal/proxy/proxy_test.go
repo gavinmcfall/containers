@@ -43,6 +43,11 @@ type fakeComfy struct {
 	lastUserdataMethod  string
 	lastUserdataRawPath string
 	lastUserdataQuery   string
+	// userdataListJSON/Status let a test drive the /userdata listing response the
+	// master returns (default `["fake"]`/200), e.g. a full_info array or a 404 for
+	// a fresh user whose workflows dir doesn't exist yet.
+	userdataListJSON   string
+	userdataListStatus int
 }
 
 func (f *fakeComfy) handler() http.Handler {
@@ -98,7 +103,14 @@ func (f *fakeComfy) handler() http.Handler {
 	mux.HandleFunc("/userdata", func(w http.ResponseWriter, r *http.Request) {
 		f.captureUserdata(r)
 		w.Header().Set("Content-Type", "application/json")
-		io.WriteString(w, `["fake"]`)
+		if f.userdataListStatus != 0 {
+			w.WriteHeader(f.userdataListStatus)
+		}
+		body := f.userdataListJSON
+		if body == "" {
+			body = `["fake"]`
+		}
+		io.WriteString(w, body)
 	})
 	mux.HandleFunc("/userdata/", func(w http.ResponseWriter, r *http.Request) {
 		f.captureUserdata(r)

@@ -12,6 +12,7 @@
 //	LIGHTHOUSE_DR_TOKEN        brand service-account bearer (from Secret; optional)
 //	LIGHTHOUSE_OWNERS_CAP      prompt-owner LRU capacity (default 4096)
 //	LIGHTHOUSE_GPU_CONFIG_PATH gpu_config.json for worker tiers (default /config/gpu_config.json) — optional, enables tier-aware dispatch
+//	LIGHTHOUSE_CURATION_DIR    curated-workflow dir (curation.json + *.json) — optional, enables role-scoped App Mode curation
 package main
 
 import (
@@ -26,6 +27,7 @@ import (
 	"time"
 
 	"github.com/gavinmcfall/containers/apps/licence-gate/internal/audit"
+	"github.com/gavinmcfall/containers/apps/licence-gate/internal/curation"
 	"github.com/gavinmcfall/containers/apps/licence-gate/internal/isolation"
 	"github.com/gavinmcfall/containers/apps/licence-gate/internal/proxy"
 	"github.com/gavinmcfall/containers/apps/licence-gate/internal/registry"
@@ -80,6 +82,16 @@ func run() error {
 	// restart-surviving, per-user history synthesized from /output/<user>/.
 	outputDir := os.Getenv("LIGHTHOUSE_OUTPUT_DIR")
 
+	// Curated-workflow set for role-scoped App Mode surfacing. Empty (default) →
+	// curation disabled (userdata is plain per-user isolation). Pointed at the
+	// mounted configMap dir (curation.json + the workflow JSONs), it overlays a
+	// vetted, role-filtered workflow set onto every caller's App Mode.
+	curationDir := os.Getenv("LIGHTHOUSE_CURATION_DIR")
+	curated, err := curation.Load(curationDir)
+	if err != nil {
+		return fmt.Errorf("load curation %q: %w", curationDir, err)
+	}
+
 	p := proxy.New(proxy.Config{
 		Upstream:    upstream,
 		Allowlist:   allow,
@@ -90,10 +102,11 @@ func run() error {
 		Now:         func() string { return time.Now().UTC().Format(time.RFC3339) },
 		WorkerTiers: workerTiers,
 		OutputDir:   outputDir,
+		Curation:    curated,
 	})
 
-	log.Printf("licence-gate listening on %s → upstream %s (registry %s, %d allowlisted nodes, %d worker tiers)",
-		listen, upstream, regPath, len(allow), len(workerTiers))
+	log.Printf("licence-gate listening on %s → upstream %s (registry %s, %d allowlisted nodes, %d worker tiers, curation=%t)",
+		listen, upstream, regPath, len(allow), len(workerTiers), !curated.Empty())
 	return http.ListenAndServe(listen, p)
 }
 

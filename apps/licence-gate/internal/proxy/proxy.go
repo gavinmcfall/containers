@@ -101,6 +101,13 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		p.handleHistory(w, r)
 	case r.Method == http.MethodGet && routePath == "/queue":
 		p.handleQueue(w, r)
+	// /api/jobs is the new frontend's render-history surface (the panel that shows
+	// completed renders with previews). Master has no per-user concept, so we scope
+	// it to the caller's own jobs AND inject create_time (the response carries only
+	// execution_start_time/execution_end_time; the frontend's schema requires
+	// create_time, so without it the panel discards valid jobs and renders empty).
+	case r.Method == http.MethodGet && routePath == "/jobs":
+		p.handleJobs(w, r)
 	// /userdata is ComfyUI's per-file storage (workflow persistence etc). Master
 	// has no per-user concept; we inject the caller's bucket into the URL so each
 	// user gets an isolated namespace. Covers GET (list+read), POST (write),
@@ -311,6 +318,105 @@ func (p *Proxy) filterQueueEntries(entries [][]json.RawMessage, user string) [][
 		}
 	}
 	return kept
+}
+
+// handleJobs scopes GET /api/jobs to the caller's own jobs and injects the
+// create_time field the frontend's schema requires. ComfyUI's jobs response
+// carries execution_start_time/execution_end_time but no create_time, so the
+// frontend rejects every job (ZodError) and the render-history panel renders
+// empty even though the data is present. Master has no per-user concept, so —
+// like /history and /queue — we filter to the caller here.
+func (p *Proxy) handleJobs(w http.ResponseWriter, r *http.Request) {
+	id, err := p.identify(r)
+	if err != nil {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	resp, err := p.forward(r, nil)
+	if err != nil {
+		http.Error(w, "upstream error", http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+
+	var payload struct {
+		Jobs []json.RawMessage `json:"jobs"`
+	}
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		// Unexpected shape — fail closed with an empty, schema-valid list.
+		writeJSON(w, http.StatusOK, jobsPage(nil))
+		return
+	}
+	kept := make([]json.RawMessage, 0, len(payload.Jobs))
+	for _, jr := range payload.Jobs {
+		var job map[string]json.RawMessage
+		if err := json.Unmarshal(jr, &job); err != nil {
+			continue
+		}
+		if !p.jobOwnedBy(job, id.User) {
+			continue
+		}
+		injectCreateTime(job)
+		if nj, err := json.Marshal(job); err == nil {
+			kept = append(kept, nj)
+		}
+	}
+	writeJSON(w, http.StatusOK, jobsPage(kept))
+}
+
+// jobsPage wraps a filtered job list in the {jobs, pagination} envelope the
+// frontend expects. Pagination reflects the post-filter set on this page.
+func jobsPage(jobs []json.RawMessage) map[string]any {
+	if jobs == nil {
+		jobs = []json.RawMessage{}
+	}
+	return map[string]any{
+		"jobs": jobs,
+		"pagination": map[string]any{
+			"offset": 0, "limit": len(jobs), "total": len(jobs), "has_more": false,
+		},
+	}
+}
+
+// jobOwnedBy reports whether a /api/jobs entry belongs to user. Primary signal is
+// preview_output.subfolder (the per-user output bucket == the caller's id, set by
+// the SaveImage filename_prefix rewrite); falls back to the prompt_id→user map
+// (the job id IS the prompt_id) for jobs without an output yet. Fail closed:
+// unattributable → not owned (no cross-user leak).
+func (p *Proxy) jobOwnedBy(job map[string]json.RawMessage, user string) bool {
+	if po, ok := job["preview_output"]; ok {
+		var pv struct {
+			Subfolder string `json:"subfolder"`
+		}
+		if json.Unmarshal(po, &pv) == nil && pv.Subfolder != "" {
+			return pv.Subfolder == user
+		}
+	}
+	if idRaw, ok := job["id"]; ok {
+		var jid string
+		if json.Unmarshal(idRaw, &jid) == nil && jid != "" {
+			if owner, known := p.cfg.Owners.Owner(jid); known {
+				return owner == user
+			}
+		}
+	}
+	return false
+}
+
+// injectCreateTime adds create_time (the field the frontend schema requires) from
+// execution_start_time (else execution_end_time, else 0). No-op if already present.
+func injectCreateTime(job map[string]json.RawMessage) {
+	if _, ok := job["create_time"]; ok {
+		return
+	}
+	for _, src := range []string{"execution_start_time", "execution_end_time"} {
+		if v, ok := job[src]; ok && len(v) > 0 && string(v) != "null" {
+			job["create_time"] = v
+			return
+		}
+	}
+	job["create_time"] = json.RawMessage("0")
 }
 
 // handleUserdata scopes /userdata/* to the caller's bucket. The user identifier

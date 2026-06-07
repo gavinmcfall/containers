@@ -32,6 +32,7 @@ type fakeComfy struct {
 	viewCalls           int
 	historyJSON         string
 	queueJSON           string
+	jobsJSON            string
 	// view: filenames that "exist"; anything else → upstream 404.
 	existingViews map[string]bool
 	// userdata capture: paths (EscapedPath) and queries master saw on the
@@ -85,6 +86,10 @@ func (f *fakeComfy) handler() http.Handler {
 	mux.HandleFunc("/queue", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		io.WriteString(w, f.queueJSON)
+	})
+	mux.HandleFunc("/jobs", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, f.jobsJSON)
 	})
 	// /userdata catch-all — captures what master sees so tests can assert the
 	// proxy injected the user bucket AND preserved %2F encoding through forward.
@@ -457,6 +462,77 @@ func TestQueueFilteredToOwner(t *testing.T) {
 	}
 	if len(got.Pending) != 0 {
 		t.Errorf("other user's pending entry leaked: %+v", got.Pending)
+	}
+}
+
+// TestJobsScopedToOwner: GET /api/jobs must return only the caller's own jobs,
+// scoped by preview_output.subfolder (the per-user output bucket == the caller's
+// id). Another user's completed job must never leak into the list.
+func TestJobsScopedToOwner(t *testing.T) {
+	fc := &fakeComfy{
+		jobsJSON: `{"jobs":[` +
+			`{"id":"j-mine","status":"completed","execution_start_time":1780731331770,"execution_end_time":1780731361040,"preview_output":{"filename":"a.png","subfolder":"gavin","type":"output"}},` +
+			`{"id":"j-other","status":"completed","execution_start_time":1780731000000,"execution_end_time":1780731009999,"preview_output":{"filename":"secret.png","subfolder":"alice","type":"output"}}` +
+			`],"pagination":{"offset":0,"limit":200,"total":2,"has_more":false}}`,
+	}
+	p, _, _, _ := newTestProxy(t, fc, nil)
+	req := httptest.NewRequest(http.MethodGet, "/api/jobs?status=completed,failed,cancelled&limit=200&offset=0", nil)
+	req.Header.Set("Authorization", "Bearer "+makeJWT("gavin"))
+	rec := do(p, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("jobs status=%d", rec.Code)
+	}
+	var got struct {
+		Jobs []map[string]json.RawMessage `json:"jobs"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("jobs body: %v (%s)", err, rec.Body.String())
+	}
+	if len(got.Jobs) != 1 {
+		t.Fatalf("expected 1 own job, got %d (other user's job leaked?): %s", len(got.Jobs), rec.Body.String())
+	}
+	var id string
+	_ = json.Unmarshal(got.Jobs[0]["id"], &id)
+	if id != "j-mine" {
+		t.Errorf("wrong job returned: %q", id)
+	}
+}
+
+// TestJobsInjectCreateTime: the frontend's Zod schema requires create_time:number,
+// but ComfyUI's /api/jobs response omits it (only execution_start_time/end_time).
+// The proxy must inject create_time (from execution_start_time) so the panel parses.
+func TestJobsInjectCreateTime(t *testing.T) {
+	fc := &fakeComfy{
+		jobsJSON: `{"jobs":[` +
+			`{"id":"j-mine","status":"completed","execution_start_time":1780731331770,"execution_end_time":1780731361040,"preview_output":{"filename":"a.png","subfolder":"gavin","type":"output"}}` +
+			`],"pagination":{"offset":0,"limit":200,"total":1,"has_more":false}}`,
+	}
+	p, _, _, _ := newTestProxy(t, fc, nil)
+	req := httptest.NewRequest(http.MethodGet, "/api/jobs?status=completed&limit=200&offset=0", nil)
+	req.Header.Set("Authorization", "Bearer "+makeJWT("gavin"))
+	rec := do(p, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("jobs status=%d", rec.Code)
+	}
+	var got struct {
+		Jobs []map[string]json.RawMessage `json:"jobs"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("jobs body: %v", err)
+	}
+	if len(got.Jobs) != 1 {
+		t.Fatalf("expected 1 job, got %d", len(got.Jobs))
+	}
+	ct, ok := got.Jobs[0]["create_time"]
+	if !ok {
+		t.Fatalf("create_time not injected (frontend Zod needs it): %s", rec.Body.String())
+	}
+	var ctn float64
+	if err := json.Unmarshal(ct, &ctn); err != nil {
+		t.Errorf("create_time not a number: %s", string(ct))
+	}
+	if ctn != 1780731331770 {
+		t.Errorf("create_time=%v, want execution_start_time 1780731331770", ctn)
 	}
 }
 

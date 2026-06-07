@@ -13,13 +13,19 @@ package proxy
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/gavinmcfall/containers/apps/licence-gate/internal/audit"
 	"github.com/gavinmcfall/containers/apps/licence-gate/internal/gate"
@@ -49,6 +55,12 @@ type Config struct {
 	// WorkerTiers maps worker_id -> VRAM tier; nil disables tier filtering (the
 	// /distributed/queue enabled_worker_ids pass through untouched).
 	WorkerTiers tier.Map
+	// OutputDir is the root of the per-user output buckets (e.g. /output, with
+	// renders under /output/<user>/...). When set, completed /api/jobs are
+	// synthesized from this persistent dir (durable across master restarts, which
+	// wipe ComfyUI's in-memory job history); empty disables it (completed jobs fall
+	// back to the live master list).
+	OutputDir string
 }
 
 // Proxy is the licence-gate HTTP handler.
@@ -332,6 +344,25 @@ func (p *Proxy) handleJobs(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
+	// Durable completed-job history: ComfyUI's /api/jobs is in-memory and wiped on
+	// every master restart. When configured with the persistent output dir, serve
+	// the completed list by synthesizing it from /output/<user>/ — durable across
+	// restarts and scoped to the caller's own bucket. In-progress/pending are not on
+	// disk yet, so those queries still go to the live master below.
+	if p.cfg.OutputDir != "" && strings.Contains(r.URL.Query().Get("status"), "completed") {
+		q := r.URL.Query()
+		limit := atoiDefault(q.Get("limit"), 200)
+		offset := atoiDefault(q.Get("offset"), 0)
+		page, total := p.jobsFromDisk(id.User, limit, offset)
+		writeJSON(w, http.StatusOK, map[string]any{
+			"jobs": page,
+			"pagination": map[string]any{
+				"offset": offset, "limit": limit, "total": total,
+				"has_more": offset+len(page) < total,
+			},
+		})
+		return
+	}
 	resp, err := p.forward(r, nil)
 	if err != nil {
 		http.Error(w, "upstream error", http.StatusBadGateway)
@@ -417,6 +448,92 @@ func injectCreateTime(job map[string]json.RawMessage) {
 		}
 	}
 	job["create_time"] = json.RawMessage("0")
+}
+
+// jobsFromDisk synthesizes a durable, per-user "completed jobs" page from the
+// persistent output dir (/output/<user>/...). One record per image file, newest
+// first. mtime drives create_time/execution_*; the synthetic id round-trips to the
+// file (base64 of "<subfolder>/<name>") for a future workflow-export handler. The
+// PNGs carry the full embedded workflow (provenance) — recoverable by loading the
+// image in ComfyUI. Returns the requested page and the total count.
+func (p *Proxy) jobsFromDisk(user string, limit, offset int) (page []json.RawMessage, total int) {
+	page = []json.RawMessage{}
+	// Fail closed against path escapes: user is the JWT sub and forms a path segment.
+	if user == "" || strings.ContainsAny(user, `/\`) || strings.Contains(user, "..") {
+		return page, 0
+	}
+	type ent struct {
+		subfolder, name string
+		mtime           time.Time
+	}
+	var ents []ent
+	base := filepath.Join(p.cfg.OutputDir, user)
+	_ = filepath.WalkDir(base, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() || !isImageName(d.Name()) {
+			return nil // missing base / unreadable / non-image → skip
+		}
+		info, e := d.Info()
+		if e != nil {
+			return nil
+		}
+		rel, e := filepath.Rel(p.cfg.OutputDir, filepath.Dir(path))
+		if e != nil {
+			return nil
+		}
+		ents = append(ents, ent{subfolder: filepath.ToSlash(rel), name: d.Name(), mtime: info.ModTime()})
+		return nil
+	})
+	sort.Slice(ents, func(i, j int) bool { return ents[i].mtime.After(ents[j].mtime) })
+	total = len(ents)
+	if offset < 0 {
+		offset = 0
+	}
+	if offset > total {
+		offset = total
+	}
+	end := total
+	if limit > 0 && offset+limit < end {
+		end = offset + limit
+	}
+	for _, e := range ents[offset:end] {
+		ms := e.mtime.UnixMilli()
+		jid := base64.RawURLEncoding.EncodeToString([]byte(e.subfolder + "/" + e.name))
+		rec, err := json.Marshal(map[string]any{
+			"id":                   jid,
+			"status":               "completed",
+			"create_time":          ms,
+			"execution_start_time": ms,
+			"execution_end_time":   ms,
+			"outputs_count":        1,
+			"preview_output": map[string]any{
+				"filename":  e.name,
+				"subfolder": e.subfolder,
+				"type":      "output",
+				"mediaType": "images",
+			},
+		})
+		if err == nil {
+			page = append(page, rec)
+		}
+	}
+	return page, total
+}
+
+// isImageName reports whether a filename is a renderable image output.
+func isImageName(name string) bool {
+	switch strings.ToLower(filepath.Ext(name)) {
+	case ".png", ".jpg", ".jpeg", ".webp":
+		return true
+	}
+	return false
+}
+
+// atoiDefault parses s as an int, returning def on empty/invalid.
+func atoiDefault(s string, def int) int {
+	if n, err := strconv.Atoi(strings.TrimSpace(s)); err == nil {
+		return n
+	}
+	return def
 }
 
 // handleUserdata scopes /userdata/* to the caller's bucket. The user identifier

@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -533,6 +535,62 @@ func TestJobsInjectCreateTime(t *testing.T) {
 	}
 	if ctn != 1780731331770 {
 		t.Errorf("create_time=%v, want execution_start_time 1780731331770", ctn)
+	}
+}
+
+// TestJobsCompletedFromDiskDurableAndScoped: completed jobs must be served from the
+// persistent /output/<user>/ dir (durable — survives a master restart that wiped the
+// in-memory history), scoped to the caller, with create_time. Other users' buckets
+// must never leak.
+func TestJobsCompletedFromDiskDurableAndScoped(t *testing.T) {
+	tmp := t.TempDir()
+	for _, d := range []string{"gavin", "alice"} {
+		if err := os.MkdirAll(filepath.Join(tmp, d), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, f := range []string{"a_00001_.png", "b_00001_.png"} {
+		os.WriteFile(filepath.Join(tmp, "gavin", f), []byte("PNG"), 0o644)
+	}
+	os.WriteFile(filepath.Join(tmp, "alice", "secret_00001_.png"), []byte("PNG"), 0o644)
+
+	// Master's in-memory history is EMPTY (as after a restart) — the durable list
+	// must still return the on-disk renders.
+	fc := &fakeComfy{jobsJSON: `{"jobs":[],"pagination":{"total":0}}`}
+	p, _, _, _ := newTestProxy(t, fc, nil)
+	p.cfg.OutputDir = tmp
+
+	req := httptest.NewRequest(http.MethodGet, "/api/jobs?status=completed,failed,cancelled&limit=200&offset=0", nil)
+	req.Header.Set("Authorization", "Bearer "+makeJWT("gavin"))
+	rec := do(p, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("jobs status=%d", rec.Code)
+	}
+	var got struct {
+		Jobs []map[string]json.RawMessage `json:"jobs"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("jobs body: %v (%s)", err, rec.Body.String())
+	}
+	if len(got.Jobs) != 2 {
+		t.Fatalf("expected 2 durable jobs from disk, got %d: %s", len(got.Jobs), rec.Body.String())
+	}
+	for _, j := range got.Jobs {
+		var po struct {
+			Subfolder string `json:"subfolder"`
+		}
+		_ = json.Unmarshal(j["preview_output"], &po)
+		if po.Subfolder != "gavin" {
+			t.Errorf("leaked non-gavin subfolder: %q", po.Subfolder)
+		}
+		if _, ok := j["create_time"]; !ok {
+			t.Errorf("durable job missing create_time: %s", j)
+		}
+		var st string
+		_ = json.Unmarshal(j["status"], &st)
+		if st != "completed" {
+			t.Errorf("durable job status=%q want completed", st)
+		}
 	}
 }
 

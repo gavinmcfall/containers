@@ -47,6 +47,9 @@ RUN set -eux; \
 # reviewable, and CI fails loudly if a patch stops applying after an upstream
 # version bump. See specific patch headers for context + upstream PR status.
 COPY patches /patches
+# Frontend compat assets (e.g. the clipspace shim) baked into the image, NOT the
+# security proxy — they belong in the frontend serving path.
+COPY web /web
 
 # ComfyUI core (pinned tag). CPU-only torch installed FIRST so ComfyUI's unpinned
 # `torch` requirement resolves to the already-present CPU build (no CUDA pull).
@@ -123,6 +126,19 @@ RUN set -eux; \
     # Build-time gate: USDU submodule must be physically present, else it egresses on import.
     test -f custom_nodes/ComfyUI_UltimateSDUpscale/repositories/ultimate_sd_upscale/scripts/ultimate-upscale.py; \
     find custom_nodes -type d -name .git -prune -exec rm -rf {} +
+
+# Restore /extensions/core/clipspace.js for ComfyUI-Impact-Pack's SAM mask editor.
+# The bundled SPA frontend (>=1.43) no longer ships this legacy module; Impact-Pack
+# still imports ClipspaceDialog from it, so it 404s and the editor won't load. We bake
+# a faithful compat shim into the frontend package's static extensions/core dir — a
+# frontend asset served by ComfyUI's own static handler (correct text/javascript),
+# deliberately NOT served from the licence-gate (security stays out of frontend assets).
+# The test -d/-f gates fail the build loudly if the frontend layout ever moves.
+RUN set -eux; \
+    CORE_DIR="$(python -c 'import comfyui_frontend_package, os; print(os.path.join(os.path.dirname(comfyui_frontend_package.__file__), "static", "extensions", "core"))')"; \
+    test -d "$CORE_DIR"; \
+    cp /web/clipspace-compat.js "$CORE_DIR/clipspace.js"; \
+    test -f "$CORE_DIR/clipspace.js"
 
 # A passwd/group entry for the non-root UID — torch's getpass.getuser() (inductor
 # cache setup) calls getpwuid(568) on import and crashes without it. HOME=/app above.

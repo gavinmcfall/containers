@@ -501,6 +501,7 @@ func (p *Proxy) jobsFromDisk(user string, limit, offset int) (page []json.RawMes
 		rec, err := json.Marshal(map[string]any{
 			"id":                   jid,
 			"status":               "completed",
+			"priority":             0,
 			"create_time":          ms,
 			"execution_start_time": ms,
 			"execution_end_time":   ms,
@@ -509,6 +510,10 @@ func (p *Proxy) jobsFromDisk(user string, limit, offset int) (page []json.RawMes
 				"filename":  e.name,
 				"subfolder": e.subfolder,
 				"type":      "output",
+				// nodeId is REQUIRED by the frontend's zPreviewOutput (z.string()).
+				// We don't know the producing node from disk; a stable placeholder
+				// satisfies the schema (the preview URL uses filename/subfolder/type).
+				"nodeId":    "0",
 				"mediaType": "images",
 			},
 		})

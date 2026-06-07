@@ -74,6 +74,12 @@ func run() error {
 		}
 	}
 
+	// Persistent output dir for the durable completed-jobs gallery. Empty (default)
+	// disables it → completed /api/jobs falls back to the master's in-memory list.
+	// Set LIGHTHOUSE_OUTPUT_DIR (and mount the output PVC read-only) to enable a
+	// restart-surviving, per-user history synthesized from /output/<user>/.
+	outputDir := os.Getenv("LIGHTHOUSE_OUTPUT_DIR")
+
 	p := proxy.New(proxy.Config{
 		Upstream:    upstream,
 		Allowlist:   allow,
@@ -83,6 +89,7 @@ func run() error {
 		Owners:      isolation.NewPromptOwners(cap),
 		Now:         func() string { return time.Now().UTC().Format(time.RFC3339) },
 		WorkerTiers: workerTiers,
+		OutputDir:   outputDir,
 	})
 
 	log.Printf("licence-gate listening on %s → upstream %s (registry %s, %d allowlisted nodes, %d worker tiers)",

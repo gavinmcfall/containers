@@ -576,12 +576,17 @@ func TestJobsCompletedFromDiskDurableAndScoped(t *testing.T) {
 		t.Fatalf("expected 2 durable jobs from disk, got %d: %s", len(got.Jobs), rec.Body.String())
 	}
 	for _, j := range got.Jobs {
-		var po struct {
-			Subfolder string `json:"subfolder"`
-		}
+		var po map[string]json.RawMessage
 		_ = json.Unmarshal(j["preview_output"], &po)
-		if po.Subfolder != "gavin" {
-			t.Errorf("leaked non-gavin subfolder: %q", po.Subfolder)
+		var subfolder string
+		_ = json.Unmarshal(po["subfolder"], &subfolder)
+		if subfolder != "gavin" {
+			t.Errorf("leaked non-gavin subfolder: %q", subfolder)
+		}
+		// zPreviewOutput.nodeId is REQUIRED (z.string()) — without it the frontend
+		// rejects the whole jobs list and the panel renders empty.
+		if _, ok := po["nodeId"]; !ok {
+			t.Errorf("preview_output missing nodeId (frontend Zod requires it): %s", j["preview_output"])
 		}
 		if _, ok := j["create_time"]; !ok {
 			t.Errorf("durable job missing create_time: %s", j)

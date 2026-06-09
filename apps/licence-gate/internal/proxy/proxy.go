@@ -66,6 +66,12 @@ type Config struct {
 	// caller's App Mode (served from this set, not any user's bucket). Nil/empty
 	// disables curation (userdata behaves as plain per-user isolation).
 	Curation *curation.Set
+	// TrustForwardedHeaders enables resolving identity from the forward-auth
+	// proxy's X-Forwarded-User/Groups headers (oauth2-proxy). It is SAFE only once
+	// that proxy is in the request path (it strips client-supplied X-Forwarded-*).
+	// Default false: identity comes solely from the decode-only JWT + brand token,
+	// so a directly-reachable client cannot forge identity during the migration.
+	TrustForwardedHeaders bool
 }
 
 // Proxy is the licence-gate HTTP handler.
@@ -136,8 +142,16 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// identify resolves the caller from the Envoy-injected Authorization header.
+// identify resolves the caller. When TrustForwardedHeaders is on (oauth2-proxy in
+// the path), a present X-Forwarded-User wins; otherwise — and for worker callbacks
+// that hit the gate directly with the brand bearer — it falls back to the
+// decode-only JWT / brand-token path.
 func (p *Proxy) identify(r *http.Request) (identity.Identity, error) {
+	if p.cfg.TrustForwardedHeaders {
+		if id, ok := identity.FromForwardedHeaders(r.Header); ok {
+			return id, nil
+		}
+	}
 	return identity.ParseAuth(r.Header.Get("Authorization"), p.cfg.BrandToken)
 }
 

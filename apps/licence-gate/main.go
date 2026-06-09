@@ -13,6 +13,7 @@
 //	LIGHTHOUSE_OWNERS_CAP      prompt-owner LRU capacity (default 4096)
 //	LIGHTHOUSE_GPU_CONFIG_PATH gpu_config.json for worker tiers (default /config/gpu_config.json) — optional, enables tier-aware dispatch
 //	LIGHTHOUSE_CURATION_DIR    curated-workflow dir (curation.json + *.json) — optional, enables role-scoped App Mode curation
+//	LIGHTHOUSE_TRUST_FORWARDED_HEADERS  "true" to resolve identity from X-Forwarded-User/Groups (oauth2-proxy) — only when that proxy is in the path
 package main
 
 import (
@@ -24,6 +25,7 @@ import (
 	"net/url"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gavinmcfall/containers/apps/licence-gate/internal/audit"
@@ -92,21 +94,27 @@ func run() error {
 		return fmt.Errorf("load curation %q: %w", curationDir, err)
 	}
 
+	// Trust forward-auth identity headers (oauth2-proxy). OFF by default — only
+	// safe once that proxy is in the request path. Flipped on at the Phase-3
+	// cutover, together with routing through oauth2-proxy.
+	trustForwarded := strings.EqualFold(os.Getenv("LIGHTHOUSE_TRUST_FORWARDED_HEADERS"), "true")
+
 	p := proxy.New(proxy.Config{
-		Upstream:    upstream,
-		Allowlist:   allow,
-		Registry:    reg,
-		BrandToken:  os.Getenv("LIGHTHOUSE_DR_TOKEN"),
-		Audit:       audit.NewWriter(os.Stdout),
-		Owners:      isolation.NewPromptOwners(cap),
-		Now:         func() string { return time.Now().UTC().Format(time.RFC3339) },
-		WorkerTiers: workerTiers,
-		OutputDir:   outputDir,
-		Curation:    curated,
+		Upstream:              upstream,
+		Allowlist:             allow,
+		Registry:              reg,
+		BrandToken:            os.Getenv("LIGHTHOUSE_DR_TOKEN"),
+		Audit:                 audit.NewWriter(os.Stdout),
+		Owners:                isolation.NewPromptOwners(cap),
+		Now:                   func() string { return time.Now().UTC().Format(time.RFC3339) },
+		WorkerTiers:           workerTiers,
+		OutputDir:             outputDir,
+		Curation:              curated,
+		TrustForwardedHeaders: trustForwarded,
 	})
 
-	log.Printf("licence-gate listening on %s → upstream %s (registry %s, %d allowlisted nodes, %d worker tiers, curation=%t)",
-		listen, upstream, regPath, len(allow), len(workerTiers), !curated.Empty())
+	log.Printf("licence-gate listening on %s → upstream %s (registry %s, %d allowlisted nodes, %d worker tiers, curation=%t, trust-forwarded-headers=%t)",
+		listen, upstream, regPath, len(allow), len(workerTiers), !curated.Empty(), trustForwarded)
 	return http.ListenAndServe(listen, p)
 }
 

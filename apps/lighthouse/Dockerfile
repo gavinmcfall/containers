@@ -140,6 +140,13 @@ RUN set -eux; \
     cp /web/clipspace-compat.js "$CORE_DIR/clipspace.js"; \
     test -f "$CORE_DIR/clipspace.js"
 
+# Lighthouse identity badge — a web-only custom node (no graph nodes) that shows
+# "Signed in as <user> · Sign out" sourced from oauth2-proxy's /oauth2/userinfo.
+# ComfyUI auto-serves + loads WEB_DIRECTORY js, so no frontend-package surgery.
+RUN set -eux; \
+    cp -r /web/lighthouse-identity custom_nodes/lighthouse-identity; \
+    test -f custom_nodes/lighthouse-identity/js/identity-badge.js
+
 # A passwd/group entry for the non-root UID — torch's getpass.getuser() (inductor
 # cache setup) calls getpwuid(568) on import and crashes without it. HOME=/app above.
 RUN set -eux; \

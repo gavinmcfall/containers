@@ -5,9 +5,10 @@
 //
 // Configuration (env):
 //
-//	MODELSERVE_LISTEN  listen address          (default :9090)
-//	MODELSERVE_ROOT    models PVC mount path    (default /models)
-//	MODELSERVE_TOKEN   shared worker bearer token (required; fail-closed if empty)
+//	MODELSERVE_LISTEN        listen address          (default :9090)
+//	MODELSERVE_ROOT          models PVC mount path    (default /models)
+//	MODELSERVE_TOKEN         shared worker bearer token (required; fail-closed if empty)
+//	MODELSERVE_REGISTRY_PATH licence registry JSON for manifest tier filtering (optional; absent = unfiltered manifest)
 package main
 
 import (
@@ -29,7 +30,7 @@ func run() error {
 	root := envOr("MODELSERVE_ROOT", "/models")
 	token := os.Getenv("MODELSERVE_TOKEN")
 
-	h, err := fileserve.Handler(root, token)
+	h, err := fileserve.New(root, token, os.Getenv("MODELSERVE_REGISTRY_PATH"))
 	if err != nil {
 		return err
 	}

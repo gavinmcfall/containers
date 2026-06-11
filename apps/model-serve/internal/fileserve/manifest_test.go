@@ -138,3 +138,13 @@ func TestManifestExcludesCacheFile(t *testing.T) {
 		t.Errorf("manifest must not list the internal cache file")
 	}
 }
+
+func TestManifestTierCaseInsensitive(t *testing.T) {
+	// A worker conf with TIER=HEAVY must behave like heavy, not silently match
+	// nothing (which strips every registry checkpoint from the manifest).
+	h, _ := setupTiered(t, "tok")
+	got := manifestPaths(t, h, "/models/manifest?tier=HEAVY", "tok")
+	if !got["checkpoints/heavy-only.safetensors"] {
+		t.Errorf("tier=HEAVY should match tier_fit 'heavy'; got %v", got)
+	}
+}

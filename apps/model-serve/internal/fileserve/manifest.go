@@ -138,9 +138,12 @@ func serveManifest(w http.ResponseWriter, r *http.Request, absRoot string, tiers
 	_ = json.NewEncoder(w).Encode(out)
 }
 
+// contains is case-insensitive: a worker conf saying TIER=HEAVY must match
+// tier_fit "heavy" rather than silently stripping every registry checkpoint
+// from the manifest (bit the fleet install, 2026-06-12).
 func contains(xs []string, s string) bool {
 	for _, x := range xs {
-		if x == s {
+		if strings.EqualFold(x, s) {
 			return true
 		}
 	}

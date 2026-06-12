@@ -21,6 +21,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -122,6 +123,14 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		p.handleView(w, r)
 	case r.Method == http.MethodGet && routePath == "/history":
 		p.handleHistory(w, r)
+	// POST /history is the frontend's history-item delete (api.deleteItem →
+	// {"delete":[id]}) and history clear ({"clear":true}). The assets gallery's
+	// ids are our synthetic disk ids — master knows nothing about them, and its
+	// own delete only touches in-memory history, never the render file — so the
+	// gate must translate them into owned-file deletions or the disk-scan gallery
+	// resurrects every "deleted" image on the next refresh.
+	case r.Method == http.MethodPost && routePath == "/history":
+		p.handleHistoryDelete(w, r)
 	case r.Method == http.MethodGet && routePath == "/queue":
 		p.handleQueue(w, r)
 	// /api/jobs is the new frontend's render-history surface (the panel that shows
@@ -541,6 +550,109 @@ func (p *Proxy) jobsFromDisk(user string, limit, offset int) (page []json.RawMes
 		}
 	}
 	return page, total
+}
+
+// maxHistoryBody caps the POST /history body we buffer for inspection.
+const maxHistoryBody = 1 << 20 // 1 MiB
+
+// handleHistoryDelete services the frontend's POST /history. Two id kinds arrive
+// here: our synthetic disk ids (assets gallery; base64url "<subfolder>/<name>")
+// which we resolve to the caller's own render file and remove from /output, and
+// live prompt_ids (queue panel) which we forward to master only when this caller
+// queued them. {"clear":true} is dropped: master's history is one global
+// in-memory structure, so forwarding it would wipe every user's history.
+func (p *Proxy) handleHistoryDelete(w http.ResponseWriter, r *http.Request) {
+	id, err := p.identify(r)
+	if err != nil {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxHistoryBody))
+	if err != nil {
+		http.Error(w, "read body", http.StatusBadRequest)
+		return
+	}
+	var req struct {
+		Delete []string `json:"delete"`
+	}
+	if len(body) > 0 {
+		if err := json.Unmarshal(body, &req); err != nil {
+			http.Error(w, "invalid history request", http.StatusBadRequest)
+			return
+		}
+	}
+
+	// Validate every id before deleting anything: one denied id fails the whole
+	// request with no side effects (fail closed; the frontend sends one id per
+	// request, so partial-batch semantics aren't worth the ambiguity).
+	var files []string // owned render files to remove
+	var live []string  // owned live prompt_ids to forward
+	for _, jid := range req.Delete {
+		if path, ok := p.syntheticJobFile(id.User, jid); ok {
+			files = append(files, path)
+			continue
+		}
+		if owner, known := p.cfg.Owners.Owner(jid); known && owner == id.User {
+			live = append(live, jid)
+			continue
+		}
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+
+	for _, path := range files {
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			http.Error(w, "delete failed", http.StatusInternalServerError)
+			return
+		}
+	}
+	if len(live) > 0 {
+		fwd, _ := json.Marshal(map[string]any{"delete": live})
+		resp, err := p.forward(r, fwd)
+		if err != nil {
+			http.Error(w, "upstream error", http.StatusBadGateway)
+			return
+		}
+		defer resp.Body.Close()
+		copyHeader(w.Header(), resp.Header)
+		w.WriteHeader(resp.StatusCode)
+		_, _ = io.Copy(w, resp.Body)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+}
+
+// syntheticJobFile decodes a jobsFromDisk id (base64url "<subfolder>/<name>")
+// into the absolute path it names, accepting it only when it is a render image
+// inside the caller's own output bucket. Anything else — bad encoding, foreign
+// bucket, traversal, non-image — fails closed. Live prompt_ids (UUIDs) fall
+// through here harmlessly: even when they happen to base64-decode, the result
+// never forms "<user>/…<image-ext>".
+func (p *Proxy) syntheticJobFile(user, jid string) (string, bool) {
+	if p.cfg.OutputDir == "" || user == "" || strings.ContainsAny(user, `/\`) || strings.Contains(user, "..") {
+		return "", false
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(jid)
+	if err != nil {
+		return "", false
+	}
+	rel := string(raw)
+	if strings.Contains(rel, `\`) || strings.HasPrefix(rel, "/") {
+		return "", false
+	}
+	segs := strings.Split(rel, "/")
+	if len(segs) < 2 || segs[0] != user {
+		return "", false
+	}
+	for _, s := range segs {
+		if s == "" || s == "." || s == ".." {
+			return "", false
+		}
+	}
+	if !isImageName(segs[len(segs)-1]) {
+		return "", false
+	}
+	return filepath.Join(p.cfg.OutputDir, filepath.FromSlash(rel)), true
 }
 
 // isImageName reports whether a filename is a renderable image output.

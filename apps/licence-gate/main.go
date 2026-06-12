@@ -80,8 +80,9 @@ func run() error {
 
 	// Persistent output dir for the durable completed-jobs gallery. Empty (default)
 	// disables it → completed /api/jobs falls back to the master's in-memory list.
-	// Set LIGHTHOUSE_OUTPUT_DIR (and mount the output PVC read-only) to enable a
-	// restart-surviving, per-user history synthesized from /output/<user>/.
+	// Set LIGHTHOUSE_OUTPUT_DIR (and mount the output PVC read-write — gallery
+	// delete removes the caller's own render files) to enable a restart-surviving,
+	// per-user history synthesized from /output/<user>/.
 	outputDir := os.Getenv("LIGHTHOUSE_OUTPUT_DIR")
 
 	// Curated-workflow set for role-scoped App Mode surfacing. Empty (default) →

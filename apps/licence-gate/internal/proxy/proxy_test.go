@@ -25,13 +25,16 @@ import (
 // fakeComfy is a stand-in ComfyUI master. It records what the proxy forwarded so
 // tests can assert the request was gated/rewritten before it reached upstream.
 type fakeComfy struct {
-	mu             sync.Mutex
+	mu                  sync.Mutex
 	promptCalls         int
 	lastPromptBody      []byte
 	lastPromptOrigin    string
 	distributedCalls    int
 	lastDistributedBody []byte
 	viewCalls           int
+	// POST /history capture (the frontend's delete-history-item wire call).
+	historyPostCalls    int
+	lastHistoryPostBody []byte
 	historyJSON         string
 	queueJSON           string
 	jobsJSON            string
@@ -87,6 +90,15 @@ func (f *fakeComfy) handler() http.Handler {
 		io.WriteString(w, `{"prompt_id":"pid-dq","worker_count":2,"auto_prepare_supported":true}`)
 	})
 	mux.HandleFunc("/history", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			body, _ := io.ReadAll(r.Body)
+			f.mu.Lock()
+			f.historyPostCalls++
+			f.lastHistoryPostBody = body
+			f.mu.Unlock()
+			w.WriteHeader(http.StatusOK)
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
 		io.WriteString(w, f.historyJSON)
 	})
@@ -194,11 +206,11 @@ func newTestProxyWithTiers(t *testing.T, fc *fakeComfy, entries []registry.Entry
 	auditBuf := &bytes.Buffer{}
 	owners := isolation.NewPromptOwners(128)
 	p := New(Config{
-		Upstream:   u,
-		Allowlist:  workflow.DefaultAllowlist,
-		Registry:   reg,
-		BrandToken: "brand-secret",
-		Audit:      audit.NewWriter(auditBuf),
+		Upstream:    u,
+		Allowlist:   workflow.DefaultAllowlist,
+		Registry:    reg,
+		BrandToken:  "brand-secret",
+		Audit:       audit.NewWriter(auditBuf),
 		Owners:      owners,
 		Now:         func() string { return "2026-06-01T00:00:00Z" },
 		WorkerTiers: tiers,

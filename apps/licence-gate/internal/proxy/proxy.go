@@ -12,12 +12,16 @@
 package proxy
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
+	"log"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -73,6 +77,13 @@ type Config struct {
 	// Default false: identity comes solely from the decode-only JWT + brand token,
 	// so a directly-reachable client cannot forge identity during the migration.
 	TrustForwardedHeaders bool
+	// Logger receives one line per gate DENIAL (400/401/403/5xx on gated
+	// routes) — without it a rejected request is invisible in this pod's logs
+	// and debugging means correlating through the forward-auth proxy's access
+	// log. Nil falls back to the std logger. Canonical /view 404s (the
+	// deliberate denied≡missing ambiguity) and passthrough traffic are not
+	// logged; renders have the audit stream.
+	Logger *log.Logger
 }
 
 // Proxy is the licence-gate HTTP handler.
@@ -110,6 +121,23 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	} else if strings.HasPrefix(routePath, "/api/") {
 		routePath = strings.TrimPrefix(routePath, "/api")
 	}
+
+	// Capture the response status so denials land in this pod's log. The
+	// wrapper delegates Hijack/Flush, so the websocket passthrough still works.
+	// 404 is deliberately not logged: /view's canonical 404 is the designed
+	// denied≡missing ambiguity and would be constant noise.
+	sw := &statusWriter{ResponseWriter: w}
+	defer func() {
+		if sw.status == http.StatusBadRequest || sw.status == http.StatusUnauthorized ||
+			sw.status == http.StatusForbidden || sw.status >= 500 {
+			user := "-"
+			if id, err := p.identify(r); err == nil && id.User != "" {
+				user = id.User
+			}
+			p.logf("deny status=%d method=%s path=%s user=%s", sw.status, r.Method, r.URL.Path, user)
+		}
+	}()
+	w = sw
 
 	switch {
 	// Both the plain (/prompt) and the ComfyUI-Distributed GPU render path
@@ -149,6 +177,42 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	default:
 		p.passthrough.ServeHTTP(w, r)
 	}
+}
+
+// statusWriter records the response status for the deny log. It delegates the
+// optional interfaces the proxy paths rely on: Hijacker (websocket passthrough)
+// and Flusher (streamed bodies). WriteHeader may never be called (implicit 200
+// via Write) — status 0 means success here.
+type statusWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (sw *statusWriter) WriteHeader(code int) {
+	sw.status = code
+	sw.ResponseWriter.WriteHeader(code)
+}
+
+func (sw *statusWriter) Flush() {
+	if f, ok := sw.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+func (sw *statusWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	if h, ok := sw.ResponseWriter.(http.Hijacker); ok {
+		return h.Hijack()
+	}
+	return nil, nil, errors.New("underlying ResponseWriter does not support hijacking")
+}
+
+// logf writes to the configured Logger (std logger when nil).
+func (p *Proxy) logf(format string, v ...any) {
+	if p.cfg.Logger != nil {
+		p.cfg.Logger.Printf(format, v...)
+		return
+	}
+	log.Printf(format, v...)
 }
 
 // identify resolves the caller. When TrustForwardedHeaders is on (oauth2-proxy in

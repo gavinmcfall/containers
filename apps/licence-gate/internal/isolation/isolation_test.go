@@ -81,3 +81,53 @@ func TestRewriteRejectsUnsafePrefix(t *testing.T) {
 		}
 	}
 }
+
+// ScopeInputs is the real per-user security boundary for uploads: a submitted
+// /prompt graph may only reference input files in the caller's own bucket
+// (<user>/…). The object_info dropdown filtering is UX; this stops a hand-edited
+// graph from loading another member's upload. Empty/absent value = no image = ok.
+func TestScopeInputsAllowsOwnInput(t *testing.T) {
+	g := parse(t, `{"prompt":{"1":{"class_type":"LoadImage","inputs":{"image":"alice/cat.png"}}}}`)
+	if err := ScopeInputs(g, "alice", workflow.DefaultAllowlist); err != nil {
+		t.Fatalf("own input should be allowed: %v", err)
+	}
+	if got := g.Nodes["1"].Inputs["image"]; got != "alice/cat.png" {
+		t.Errorf("value must be left intact, got %v", got)
+	}
+}
+
+func TestScopeInputsDeniesOtherUsersInput(t *testing.T) {
+	g := parse(t, `{"prompt":{"1":{"class_type":"LoadImage","inputs":{"image":"bob/cat.png"}}}}`)
+	if err := ScopeInputs(g, "alice", workflow.DefaultAllowlist); err == nil {
+		t.Fatal("referencing another user's input must be rejected")
+	}
+}
+
+func TestScopeInputsDeniesBareFilename(t *testing.T) {
+	g := parse(t, `{"prompt":{"1":{"class_type":"LoadImage","inputs":{"image":"example.png"}}}}`)
+	if err := ScopeInputs(g, "alice", workflow.DefaultAllowlist); err == nil {
+		t.Fatal("bare top-level input (no user subfolder) must be rejected")
+	}
+}
+
+func TestScopeInputsAllowsEmptyOrAbsent(t *testing.T) {
+	for _, body := range []string{
+		`{"prompt":{"1":{"class_type":"LoadImage","inputs":{"image":""}}}}`,
+		`{"prompt":{"1":{"class_type":"LoadImage","inputs":{}}}}`,
+	} {
+		g := parse(t, body)
+		if err := ScopeInputs(g, "alice", workflow.DefaultAllowlist); err != nil {
+			t.Errorf("empty/absent image should be allowed (%s): %v", body, err)
+		}
+	}
+}
+
+func TestScopeInputsRejectsTraversal(t *testing.T) {
+	// `alice\\x.png` is the JSON encoding of the literal path alice\x.png.
+	for _, val := range []string{"alice/../bob/x.png", "../x.png", `alice\\x.png`, "/etc/passwd", "http://x/y.png"} {
+		g := parse(t, `{"prompt":{"1":{"class_type":"LoadImage","inputs":{"image":"`+val+`"}}}}`)
+		if err := ScopeInputs(g, "alice", workflow.DefaultAllowlist); err == nil {
+			t.Errorf("traversal/escape %q must be rejected", val)
+		}
+	}
+}

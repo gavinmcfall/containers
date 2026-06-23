@@ -21,6 +21,7 @@ import (
 	"io"
 	"io/fs"
 	"log"
+	"mime/multipart"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -67,6 +68,12 @@ type Config struct {
 	// wipe ComfyUI's in-memory job history); empty disables it (completed jobs fall
 	// back to the live master list).
 	OutputDir string
+	// InputDir is the root of the per-user input buckets (e.g. /input, with
+	// uploads under /input/<user>/...). When set, /upload/image is forced into the
+	// caller's bucket, /object_info lists only the caller's own uploads, and
+	// /prompt enforces that LoadImage inputs reference the caller's bucket. Empty
+	// disables input isolation (uploads pass through to the global input dir).
+	InputDir string
 	// Curation is the role-scoped set of vetted workflows overlaid onto every
 	// caller's App Mode (served from this set, not any user's bucket). Nil/empty
 	// disables curation (userdata behaves as plain per-user isolation).
@@ -147,6 +154,14 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// using the distributed endpoint.
 	case r.Method == http.MethodPost && (routePath == "/prompt" || routePath == "/distributed/queue"):
 		p.handlePrompt(w, r)
+	// /upload/image (+ /upload/mask) drop the file into the caller's own input
+	// bucket (subfolder forced to <user>), so one member's uploads never land in
+	// another's LoadImage picker. /object_info lists only the caller's own uploads.
+	// Both are no-ops (passthrough) when InputDir is unset.
+	case r.Method == http.MethodPost && (routePath == "/upload/image" || routePath == "/upload/mask"):
+		p.handleUpload(w, r)
+	case r.Method == http.MethodGet && (routePath == "/object_info" || strings.HasPrefix(routePath, "/object_info/")):
+		p.handleObjectInfo(w, r)
 	case r.Method == http.MethodGet && routePath == "/view":
 		p.handleView(w, r)
 	case r.Method == http.MethodGet && routePath == "/history":
@@ -278,6 +293,15 @@ func (p *Proxy) handlePrompt(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unsafe output target: "+err.Error(), http.StatusBadRequest)
 		return
 	}
+	// Enforce that every image-loader input references the caller's OWN upload
+	// bucket — the real per-user isolation boundary (object_info filtering is only
+	// UX; a hand-edited graph would bypass it). Only when input isolation is on.
+	if p.cfg.InputDir != "" {
+		if err := isolation.ScopeInputs(graph, id.User, p.cfg.Allowlist); err != nil {
+			http.Error(w, "unsafe input reference: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+	}
 	rewritten, err := reencodePrompt(body, graph)
 	if err != nil {
 		http.Error(w, "re-encode prompt", http.StatusInternalServerError)
@@ -342,6 +366,117 @@ func (p *Proxy) handleView(w http.ResponseWriter, r *http.Request) {
 	copyHeader(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
 	_, _ = io.Copy(w, resp.Body)
+}
+
+// maxUploadMem caps the in-RAM portion of a multipart upload before spilling to
+// temp files; the file itself can be larger.
+const maxUploadMem = 32 << 20 // 32 MiB
+
+// handleUpload forces an image/mask upload into the caller's own input bucket by
+// overriding the multipart `subfolder` field to the caller's user before
+// forwarding. ComfyUI then saves under /input/<user>/, and its response already
+// carries subfolder=<user> (so the frontend's combo value becomes <user>/name).
+// With InputDir unset the request passes through untouched.
+func (p *Proxy) handleUpload(w http.ResponseWriter, r *http.Request) {
+	if p.cfg.InputDir == "" {
+		p.passthrough.ServeHTTP(w, r)
+		return
+	}
+	id, err := p.identify(r)
+	if err != nil {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	if err := r.ParseMultipartForm(maxUploadMem); err != nil || r.MultipartForm == nil {
+		http.Error(w, "bad multipart upload", http.StatusBadRequest)
+		return
+	}
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+	for field, headers := range r.MultipartForm.File {
+		for _, fh := range headers {
+			src, err := fh.Open()
+			if err != nil {
+				http.Error(w, "read upload", http.StatusBadRequest)
+				return
+			}
+			fw, err := mw.CreateFormFile(field, fh.Filename)
+			if err == nil {
+				_, err = io.Copy(fw, src)
+			}
+			src.Close()
+			if err != nil {
+				http.Error(w, "re-encode upload", http.StatusInternalServerError)
+				return
+			}
+		}
+	}
+	for field, vals := range r.MultipartForm.Value {
+		if field == "subfolder" {
+			continue // dropped — we set it to the caller's bucket below
+		}
+		for _, v := range vals {
+			_ = mw.WriteField(field, v)
+		}
+	}
+	_ = mw.WriteField("subfolder", id.User)
+	if err := mw.Close(); err != nil {
+		http.Error(w, "re-encode upload", http.StatusInternalServerError)
+		return
+	}
+
+	target := *p.cfg.Upstream
+	target.Path = singleJoin(p.cfg.Upstream.Path, r.URL.Path)
+	target.RawQuery = r.URL.RawQuery
+	req, err := http.NewRequestWithContext(r.Context(), r.Method, target.String(), &buf)
+	if err != nil {
+		http.Error(w, "upstream request", http.StatusInternalServerError)
+		return
+	}
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	req.Header.Del("Origin") // DNS-rebinding 403 — see forward().
+	resp, err := p.client.Do(req)
+	if err != nil {
+		http.Error(w, "upstream error", http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+	copyHeader(w.Header(), resp.Header)
+	w.WriteHeader(resp.StatusCode)
+	_, _ = io.Copy(w, resp.Body)
+}
+
+// handleObjectInfo forwards /object_info to the master then rewrites every
+// image-loader's file list to the caller's own uploads (<user>/file), so a member
+// only ever sees their own uploads in the LoadImage picker. With InputDir unset it
+// is a plain passthrough.
+func (p *Proxy) handleObjectInfo(w http.ResponseWriter, r *http.Request) {
+	if p.cfg.InputDir == "" {
+		p.passthrough.ServeHTTP(w, r)
+		return
+	}
+	id, err := p.identify(r)
+	if err != nil {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	resp, err := p.forward(r, nil)
+	if err != nil {
+		http.Error(w, "upstream error", http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode == http.StatusOK {
+		files, _ := isolation.ListUserInputs(p.cfg.InputDir, id.User)
+		if injected, err := isolation.InjectObjectInfo(body, id.User, files, p.cfg.Allowlist); err == nil {
+			body = injected
+		}
+	}
+	copyHeader(w.Header(), resp.Header)
+	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+	w.WriteHeader(resp.StatusCode)
+	_, _ = w.Write(body)
 }
 
 func (p *Proxy) handleHistory(w http.ResponseWriter, r *http.Request) {

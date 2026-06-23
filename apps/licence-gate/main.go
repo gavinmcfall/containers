@@ -13,6 +13,7 @@
 //	LIGHTHOUSE_OWNERS_CAP      prompt-owner LRU capacity (default 4096)
 //	LIGHTHOUSE_GPU_CONFIG_PATH gpu_config.json for worker tiers (default /config/gpu_config.json) — optional, enables tier-aware dispatch
 //	LIGHTHOUSE_CURATION_DIR    curated-workflow dir (curation.json + *.json) — optional, enables role-scoped App Mode curation
+//	LIGHTHOUSE_INPUT_DIR       per-user input bucket root (e.g. /input) — optional, enables per-user upload isolation
 //	LIGHTHOUSE_TRUST_FORWARDED_HEADERS  "true" to resolve identity from X-Forwarded-User/Groups (oauth2-proxy) — only when that proxy is in the path
 package main
 
@@ -85,6 +86,13 @@ func run() error {
 	// per-user history synthesized from /output/<user>/.
 	outputDir := os.Getenv("LIGHTHOUSE_OUTPUT_DIR")
 
+	// Set LIGHTHOUSE_INPUT_DIR (and mount the input PVC — RW for master at
+	// /app/input, readable by this gate at /input) to enable per-user upload
+	// isolation: uploads land in /input/<user>/, object_info lists only the
+	// caller's own uploads, and /prompt enforces own-bucket LoadImage refs. Empty
+	// (default) → uploads pass through to ComfyUI's global input dir.
+	inputDir := os.Getenv("LIGHTHOUSE_INPUT_DIR")
+
 	// Curated-workflow set for role-scoped App Mode surfacing. Empty (default) →
 	// curation disabled (userdata is plain per-user isolation). Pointed at the
 	// mounted configMap dir (curation.json + the workflow JSONs), it overlays a
@@ -110,12 +118,13 @@ func run() error {
 		Now:                   func() string { return time.Now().UTC().Format(time.RFC3339) },
 		WorkerTiers:           workerTiers,
 		OutputDir:             outputDir,
+		InputDir:              inputDir,
 		Curation:              curated,
 		TrustForwardedHeaders: trustForwarded,
 	})
 
-	log.Printf("licence-gate listening on %s → upstream %s (registry %s, %d allowlisted nodes, %d worker tiers, curation=%t, trust-forwarded-headers=%t)",
-		listen, upstream, regPath, len(allow), len(workerTiers), !curated.Empty(), trustForwarded)
+	log.Printf("licence-gate listening on %s → upstream %s (registry %s, %d allowlisted nodes, %d worker tiers, curation=%t, input-isolation=%t, trust-forwarded-headers=%t)",
+		listen, upstream, regPath, len(allow), len(workerTiers), !curated.Empty(), inputDir != "", trustForwarded)
 	return http.ListenAndServe(listen, p)
 }
 

@@ -56,10 +56,12 @@ func TestScopeViewRejectsTraversal(t *testing.T) {
 	}
 }
 
-func TestScopeViewRejectsNonOutputType(t *testing.T) {
-	for _, typ := range []string{"input", "temp", "", "OUTPUT"} {
+func TestScopeViewRejectsNonScopableType(t *testing.T) {
+	// output + input are user-scopable (2026-06-23); temp and unknown types are
+	// not. Type matching is exact/case-sensitive (ComfyUI uses lowercase).
+	for _, typ := range []string{"temp", "", "OUTPUT"} {
 		if err := ScopeView("alice", "x.png", "alice", typ); err == nil {
-			t.Errorf("type %q must be rejected (only 'output' is read-scopable)", typ)
+			t.Errorf("type %q must be rejected (only 'output'/'input' are read-scopable)", typ)
 		}
 	}
 }
@@ -117,5 +119,33 @@ func TestPromptOwnerReRememberRefreshes(t *testing.T) {
 	}
 	if _, known := o.Owner("p2"); known {
 		t.Error("p2 should have been evicted")
+	}
+}
+
+// Input uploads are user-scoped the same way outputs are (per-user isolation,
+// 2026-06-23): a caller may /view their OWN /input/<user>/ files but not another
+// user's, and bare top-level inputs are not user-scoped (denied). temp stays
+// unscopable.
+func TestScopeViewAllowsOwnInput(t *testing.T) {
+	if err := ScopeView("alice", "cat.png", "alice", "input"); err != nil {
+		t.Fatalf("own input view should be allowed: %v", err)
+	}
+}
+
+func TestScopeViewDeniesOtherUsersInput(t *testing.T) {
+	if err := ScopeView("alice", "secret.png", "bob", "input"); err == nil {
+		t.Fatal("viewing another user's input must be denied")
+	}
+}
+
+func TestScopeViewDeniesBareTopLevelInput(t *testing.T) {
+	if err := ScopeView("alice", "example.png", "", "input"); err == nil {
+		t.Fatal("bare top-level input (no user subfolder) must be denied")
+	}
+}
+
+func TestScopeViewDeniesTempType(t *testing.T) {
+	if err := ScopeView("alice", "x.png", "alice", "temp"); err == nil {
+		t.Fatal("temp type must remain unscopable (denied)")
 	}
 }

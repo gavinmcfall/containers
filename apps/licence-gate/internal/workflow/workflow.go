@@ -47,6 +47,10 @@ type ModelField struct {
 type Spec struct {
 	ModelFields []ModelField `json:"model_fields,omitempty"`
 	OutputField string       `json:"output_field,omitempty"`
+	// InputField names the image-input field a loader node reads (LoadImage's
+	// "image"). It drives per-user input isolation the way OutputField drives
+	// output bucketing: the gate scopes/validates this field's value to <user>/…
+	InputField string `json:"input_field,omitempty"`
 }
 
 // Allowlist maps an allowed class_type to its per-class metadata.
@@ -86,6 +90,10 @@ var DefaultAllowlist = Allowlist{
 	"SaveImage":        {OutputField: "filename_prefix"},
 	"SaveAnimatedWEBP": {OutputField: "filename_prefix"},
 	"SaveAnimatedPNG":  {OutputField: "filename_prefix"},
+	// Image input loaders — InputField scopes the selected file to the caller's
+	// own /input/<user>/ bucket (per-user upload isolation).
+	"LoadImage":     {InputField: "image"},
+	"LoadImageMask": {InputField: "image"},
 	// No-special-handling nodes used by a standard SDXL text2img workshop graph.
 	"CLIPTextEncode":   {},
 	"KSampler":         {},

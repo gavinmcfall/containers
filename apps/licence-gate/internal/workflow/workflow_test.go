@@ -119,3 +119,23 @@ func TestModelReferencesExtractsEmbeddings(t *testing.T) {
 		}
 	}
 }
+
+// InputField on a Spec identifies the image-input field a loader node reads
+// (LoadImage's "image"), so per-user input isolation can scope/validate it the
+// same way OutputField drives output bucketing. It must round-trip through the
+// JSON allowlist loader and be present on the built-in default for LoadImage.
+func TestInputFieldRoundTripsThroughAllowlistLoad(t *testing.T) {
+	a, err := LoadAllowlist([]byte(`{"LoadImage":{"input_field":"image"}}`))
+	if err != nil {
+		t.Fatalf("LoadAllowlist: %v", err)
+	}
+	if got := a["LoadImage"].InputField; got != "image" {
+		t.Fatalf("loaded LoadImage.InputField = %q, want %q", got, "image")
+	}
+}
+
+func TestDefaultAllowlistTagsLoadImageInputField(t *testing.T) {
+	if got := DefaultAllowlist["LoadImage"].InputField; got != "image" {
+		t.Fatalf("DefaultAllowlist LoadImage.InputField = %q, want %q", got, "image")
+	}
+}

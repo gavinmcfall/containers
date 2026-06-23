@@ -8,16 +8,17 @@ import (
 	"sync"
 )
 
-// ScopeView confines a ComfyUI /view request to the caller's own output bucket
-// (ADR 015 read-side). The file served is type-dir/<subfolder>/<filename>; a
-// user may read only files whose first path segment is their own user id, and
-// only from the `output` type (input/temp are not user-scoped reads in Phase 1).
-// Any traversal/escape (`..`, backslash, scheme, absolute) is rejected. The HTTP
+// ScopeView confines a ComfyUI /view request to the caller's own bucket (ADR 015
+// read-side). The file served is type-dir/<subfolder>/<filename>; a user may read
+// only files whose first path segment is their own user id, from the `output`
+// bucket (renders) or the `input` bucket (their own uploads, per-user isolation
+// 2026-06-23). `temp` and any other type are not user-scoped and rejected. Any
+// traversal/escape (`..`, backslash, scheme, absolute) is rejected. The HTTP
 // layer must return an identical response for an error here vs a genuine 404, so
 // existence of another user's file cannot be probed.
 func ScopeView(user, filename, subfolder, typ string) error {
-	if typ != "output" {
-		return fmt.Errorf("view type %q is not user-scopable (only output)", typ)
+	if typ != "output" && typ != "input" {
+		return fmt.Errorf("view type %q is not user-scopable (only output, input)", typ)
 	}
 	for _, seg := range []string{filename, subfolder} {
 		if strings.ContainsAny(seg, `\`) || strings.Contains(seg, "..") ||

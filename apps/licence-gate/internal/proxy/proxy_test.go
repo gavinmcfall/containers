@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -40,6 +41,12 @@ type fakeComfy struct {
 	jobsJSON            string
 	// view: filenames that "exist"; anything else → upstream 404.
 	existingViews map[string]bool
+	// object_info body the master returns (per-class node schema).
+	objectInfoJSON string
+	// upload capture: what subfolder/filename the master saw on /upload/image.
+	uploadCalls         int
+	lastUploadSubfolder string
+	lastUploadFilename  string
 	// userdata capture: paths (EscapedPath) and queries master saw on the
 	// /userdata routes, plus call counts. Filled by handler() below.
 	userdataCalls       int
@@ -79,6 +86,30 @@ func (f *fakeComfy) handler() http.Handler {
 		// canonical 404, so the test proves the proxy normalises it.
 		w.WriteHeader(http.StatusNotFound)
 		io.WriteString(w, `{"comfy":"file not found, distinct body"}`)
+	})
+	objectInfo := func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		body := f.objectInfoJSON
+		if body == "" {
+			body = `{}`
+		}
+		io.WriteString(w, body)
+	}
+	mux.HandleFunc("/object_info", objectInfo)
+	mux.HandleFunc("/object_info/", objectInfo)
+	mux.HandleFunc("/upload/image", func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseMultipartForm(8 << 20)
+		f.mu.Lock()
+		f.uploadCalls++
+		f.lastUploadSubfolder = r.FormValue("subfolder")
+		if r.MultipartForm != nil {
+			if fhs := r.MultipartForm.File["image"]; len(fhs) > 0 {
+				f.lastUploadFilename = fhs[0].Filename
+			}
+		}
+		f.mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"name":%q,"subfolder":%q,"type":"input"}`, f.lastUploadFilename, f.lastUploadSubfolder)
 	})
 	mux.HandleFunc("/distributed/queue", func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
@@ -422,14 +453,136 @@ func TestViewOtherBucketDeniedIdenticalToGenuine404(t *testing.T) {
 	}
 }
 
-func TestViewNonOutputTypeDenied(t *testing.T) {
+func TestViewTempTypeDenied(t *testing.T) {
+	// output + input are user-scopable (2026-06-23); temp is not.
 	fc := &fakeComfy{existingViews: map[string]bool{"gavin/x.png": true}}
 	p, _, _, _ := newTestProxy(t, fc, nil)
-	req := httptest.NewRequest(http.MethodGet, "/view?filename=x.png&subfolder=gavin&type=input", nil)
+	req := httptest.NewRequest(http.MethodGet, "/view?filename=x.png&subfolder=gavin&type=temp", nil)
 	req.Header.Set("Authorization", "Bearer "+makeJWT("gavin"))
 	rec := do(p, req)
 	if rec.Code != http.StatusNotFound {
-		t.Fatalf("non-output view type must be denied as 404, got %d", rec.Code)
+		t.Fatalf("temp view type must be denied as 404, got %d", rec.Code)
+	}
+}
+
+// Input uploads are now per-user (2026-06-23): a caller may view their own
+// /input/<user>/ file but not another user's.
+func TestViewOwnInputForwarded(t *testing.T) {
+	fc := &fakeComfy{existingViews: map[string]bool{"alice/cat.png": true}}
+	p, _, _, _ := newTestProxy(t, fc, nil)
+	req := httptest.NewRequest(http.MethodGet, "/view?filename=cat.png&subfolder=alice&type=input", nil)
+	req.Header.Set("Authorization", "Bearer "+makeJWT("alice"))
+	rec := do(p, req)
+	if rec.Code != http.StatusOK || rec.Body.String() != "PNGDATA" {
+		t.Fatalf("own input view should stream: status=%d body=%q", rec.Code, rec.Body.String())
+	}
+}
+
+func TestViewOtherUsersInputDenied(t *testing.T) {
+	fc := &fakeComfy{existingViews: map[string]bool{"bob/secret.png": true}}
+	p, _, _, _ := newTestProxy(t, fc, nil)
+	req := httptest.NewRequest(http.MethodGet, "/view?filename=secret.png&subfolder=bob&type=input", nil)
+	req.Header.Set("Authorization", "Bearer "+makeJWT("alice"))
+	rec := do(p, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("another user's input must be denied (404), got %d", rec.Code)
+	}
+	if fc.viewCalls != 0 {
+		t.Errorf("denied input view must not reach upstream, calls=%d", fc.viewCalls)
+	}
+}
+
+// /upload/image must land in the caller's own /input/<user>/ bucket regardless of
+// any client-supplied subfolder (the upload-side of per-user isolation).
+func TestUploadForcesCallerSubfolder(t *testing.T) {
+	fc := &fakeComfy{}
+	p, _, _, _ := newTestProxy(t, fc, nil)
+	p.cfg.InputDir = t.TempDir()
+	body, ctype := multipartUpload(t, "cat.png", "PNGDATA", "bob") // client tries subfolder=bob
+	req := httptest.NewRequest(http.MethodPost, "/upload/image", bytes.NewReader(body))
+	req.Header.Set("Content-Type", ctype)
+	req.Header.Set("Authorization", "Bearer "+makeJWT("alice"))
+	rec := do(p, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("upload status=%d body=%q", rec.Code, rec.Body.String())
+	}
+	if fc.lastUploadSubfolder != "alice" {
+		t.Fatalf("subfolder must be forced to caller; master saw %q want alice", fc.lastUploadSubfolder)
+	}
+	if fc.lastUploadFilename != "cat.png" {
+		t.Errorf("filename must be preserved; master saw %q", fc.lastUploadFilename)
+	}
+}
+
+// GET /object_info must list only the caller's own uploads in LoadImage, not the
+// global input dir.
+func TestObjectInfoInjectsCallerInputs(t *testing.T) {
+	fc := &fakeComfy{objectInfoJSON: `{"LoadImage":{"input":{"required":{"image":[["global.png"],{"image_upload":true}]}}}}`}
+	p, _, _, _ := newTestProxy(t, fc, nil)
+	dir := t.TempDir()
+	p.cfg.InputDir = dir
+	writeInput(t, filepath.Join(dir, "alice", "cat.png"))
+	req := httptest.NewRequest(http.MethodGet, "/object_info", nil)
+	req.Header.Set("Authorization", "Bearer "+makeJWT("alice"))
+	rec := do(p, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("object_info status=%d", rec.Code)
+	}
+	if strings.Contains(rec.Body.String(), "global.png") {
+		t.Fatalf("global listing must be replaced: %s", rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "alice/cat.png") {
+		t.Fatalf("caller's input must be injected: %s", rec.Body.String())
+	}
+}
+
+// A hand-edited graph referencing another user's input is rejected before reaching
+// the master (the real isolation boundary).
+func TestPromptRejectsForeignInput(t *testing.T) {
+	fc := &fakeComfy{}
+	p, _, _, _ := newTestProxy(t, fc, nil)
+	p.cfg.InputDir = t.TempDir()
+	graph := []byte(`{"client_id":"c1","prompt":{
+		"1":{"class_type":"LoadImage","inputs":{"image":"bob/secret.png"}},
+		"2":{"class_type":"SaveImage","inputs":{"filename_prefix":"out","images":["1",0]}}
+	}}`)
+	req := httptest.NewRequest(http.MethodPost, "/prompt", bytes.NewReader(graph))
+	req.Header.Set("Authorization", "Bearer "+makeJWT("alice"))
+	rec := do(p, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("foreign input must be rejected with 400, got %d (%s)", rec.Code, rec.Body.String())
+	}
+	if fc.promptCalls != 0 {
+		t.Errorf("rejected prompt must not reach upstream, calls=%d", fc.promptCalls)
+	}
+}
+
+// multipartUpload builds a /upload/image multipart body (image part + a subfolder
+// field the gate is expected to override).
+func multipartUpload(t *testing.T, filename, content, subfolder string) ([]byte, string) {
+	t.Helper()
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+	fw, err := mw.CreateFormFile("image", filename)
+	if err != nil {
+		t.Fatal(err)
+	}
+	io.WriteString(fw, content)
+	_ = mw.WriteField("subfolder", subfolder)
+	_ = mw.WriteField("type", "input")
+	if err := mw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes(), mw.FormDataContentType()
+}
+
+func writeInput(t *testing.T, p string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
 	}
 }
 

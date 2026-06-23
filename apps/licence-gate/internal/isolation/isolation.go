@@ -9,6 +9,7 @@ package isolation
 
 import (
 	"fmt"
+	"path"
 	"strings"
 
 	"github.com/gavinmcfall/containers/apps/licence-gate/internal/workflow"
@@ -42,6 +43,50 @@ func RewriteOutputs(g *workflow.Graph, user string, allow workflow.Allowlist) er
 		}
 		// node.Inputs is a map (reference) — mutation is reflected in g.Nodes[id].
 		node.Inputs[field] = user + "/" + prefix
+	}
+	return nil
+}
+
+// ScopeInputs is the per-user upload security boundary: every allowlisted image
+// loader's InputField value in a submitted graph must reference a file in the
+// caller's OWN bucket (first path segment == user). An empty/absent value (no
+// image selected) or a non-string value (a graph-link input, not a file) is left
+// alone; any other-user reference, bare top-level filename, or traversal/escape
+// rejects the whole workflow. This is enforcement; the object_info dropdown
+// filtering is only UX and a hand-edited graph would bypass it.
+func ScopeInputs(g *workflow.Graph, user string, allow workflow.Allowlist) error {
+	for id, node := range g.Nodes {
+		spec, ok := allow[node.ClassType]
+		if !ok || spec.InputField == "" {
+			continue
+		}
+		val, isStr := node.Inputs[spec.InputField].(string)
+		if !isStr || val == "" {
+			continue
+		}
+		if err := inputInUserBucket(user, val); err != nil {
+			return fmt.Errorf("node %s (%s): %w", id, node.ClassType, err)
+		}
+	}
+	return nil
+}
+
+// inputInUserBucket reports whether val is a safe <user>/… input reference.
+func inputInUserBucket(user, val string) error {
+	if strings.ContainsAny(val, `\`) || strings.Contains(val, "..") ||
+		strings.Contains(val, "://") || strings.HasPrefix(val, "/") {
+		return fmt.Errorf("unsafe input path %q", val)
+	}
+	rel := path.Clean(val)
+	if rel == "." || rel == ".." || strings.HasPrefix(rel, "../") {
+		return fmt.Errorf("input path escapes the input store: %q", val)
+	}
+	first := rel
+	if i := strings.IndexByte(rel, '/'); i >= 0 {
+		first = rel[:i]
+	}
+	if first != user {
+		return fmt.Errorf("input %q is not in %q's bucket", val, user)
 	}
 	return nil
 }
